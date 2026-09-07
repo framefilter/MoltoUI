@@ -13793,9 +13793,18 @@ impl App {
                 let retries = st
                     .pin_retries
                     .map_or("\u{2014}".to_string(), |n| n.to_string());
+                // The token's own reported name when it has one (e.g. a
+                // Nitrokey's admin application); otherwise the generic name
+                // for its fingerprinted applet family — same fallback as
+                // `keyroostctl piv status`'s plain-text output.
+                let applet_name = if st.applet_name.is_empty() {
+                    st.applet_fingerprint.applet_name().to_string()
+                } else {
+                    st.applet_name.clone()
+                };
                 ui.label(
                     egui::RichText::new(format!(
-                        "Applet {ver} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
+                        "{applet_name} \u{00B7} Applet {ver} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
                     ))
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
