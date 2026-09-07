@@ -390,6 +390,25 @@ pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
     Ok(guid)
 }
 
+/// Run [`keyroost_piv::decode_bcd_serial`] over `serial`, but only for applets
+/// known to report their serial in BCD coding. Token2 is the only such device
+/// identified so far; others may be discovered and added here later. Every
+/// other vendor's serial is a plain integer already, and BCD-decoding one
+/// would corrupt it. Shared by [`PivSession::status`] and
+/// [`PivSession::status_detailed`].
+fn decode_serial_if_bcd(
+    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    serial: Option<u128>,
+) -> Option<u128> {
+    let reports_bcd_serial =
+        matches!(fingerprint, keyroost_piv::fingerprint::AppletFingerprint::Token2);
+    if reports_bcd_serial {
+        serial.map(keyroost_piv::decode_bcd_serial)
+    } else {
+        serial
+    }
+}
+
 impl PivSession {
     /// Connect to `reader_name` and SELECT the PIV application. Returns
     /// [`TransportError::NoPivApplet`] when the card has no PIV applet.
@@ -715,7 +734,10 @@ impl PivSession {
         // to overwrite the real one.
         let (applet_fingerprint, applet_name, version_firmware, fingerprint_serial) =
             self.applet_fingerprint(version.as_deref());
-        let serial = fingerprint_serial.or_else(|| self.serial());
+        let serial = decode_serial_if_bcd(
+            applet_fingerprint,
+            fingerprint_serial.or_else(|| self.serial()),
+        );
         let pin_retries = self.pin_retries();
         // Best-effort: a transport hiccup reading the CHUID shouldn't fail
         // the whole status snapshot, any more than an unsupported GET
@@ -759,7 +781,10 @@ impl PivSession {
         // See the identical ordering (and why) in `status`.
         let (applet_fingerprint, applet_name, version_firmware, fingerprint_serial) =
             self.applet_fingerprint(version.as_deref());
-        let serial = fingerprint_serial.or_else(|| self.serial());
+        let serial = decode_serial_if_bcd(
+            applet_fingerprint,
+            fingerprint_serial.or_else(|| self.serial()),
+        );
         let pin_retries = self.pin_retries();
         let chuid = self.read_chuid().unwrap_or_default();
 
