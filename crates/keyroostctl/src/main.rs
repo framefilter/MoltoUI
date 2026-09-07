@@ -151,10 +151,36 @@ mod json_out {
         /// Yubico GET VERSION's raw reply, dotted (or hex past 4 bytes),
         /// tolerant of any non-empty byte count.
         pub version: Option<String>,
-        pub serial: Option<u32>,
+        /// Ordinarily the Yubico GET SERIAL extension widened to `u128`; when
+        /// a specific fingerprint's own probe supplies a serial instead
+        /// (currently: a Nitrokey's admin application), that one is used and
+        /// GET SERIAL is skipped — a Nitrokey answers that extension too, but
+        /// with a number that isn't its real serial. `None` when neither
+        /// source answers.
+        pub serial: Option<u128>,
         pub pin_retries: Option<u8>,
         pub chuid: Option<PivChuidJson>,
         pub slots: Vec<PivSlotJson>,
+        /// Best-effort applet fingerprint — from ATR/SELECT text as well as
+        /// AID-selectability/instruction-support probes; see
+        /// `keyroost_piv::fingerprint` for the full scheme. Its `Display`
+        /// form — e.g. `"YubiKey"` or `"OpenFips201::SwissbitIShield2"`.
+        pub applet_fingerprint: String,
+        /// The token's own reported name, when one was actually discovered
+        /// (currently: a Nitrokey's admin application, for `Trussed::NitroKey`).
+        /// Empty when none was — not backfilled with a generic name for
+        /// `applet_fingerprint`, so an empty string here means specifically
+        /// "the token didn't tell us its name," not "fingerprinting failed."
+        /// (The plain-text `piv status` output does apply that fallback —
+        /// see `run_piv`.)
+        pub applet_name: String,
+        /// The applet's own firmware version, dotted (same formatting as
+        /// `version`), when a specific fingerprint's probe discovered one —
+        /// currently `Trussed::NitroKey` (Trussed's admin application) only.
+        /// Not necessarily equal to `version`, which is the PIV applet's own
+        /// version. `None` when no such probe applies or it found nothing
+        /// parseable.
+        pub version_firmware: Option<String>,
     }
 
     /// The card's CHUID — FASC-N, GUID, expiration, signature, and LRC. The
@@ -6117,18 +6143,54 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             cert_len: if s.cert_present { s.cert_len } else { 0 },
                         })
                         .collect(),
+                    applet_fingerprint: status.applet_fingerprint.to_string(),
+                    applet_name: status.applet_name.clone(),
+                    version_firmware: status
+                        .version_firmware
+                        .as_deref()
+                        .map(keyroost_piv::format_version_bytes),
                 })?;
                 return Ok(());
             }
 
+            // `applet_name` is only ever the token's own reported name (e.g.
+            // a Nitrokey's admin application) — empty means none was
+            // discovered, not that fingerprinting failed, so
+            // the plain-text line falls back to the fingerprint's generic
+            // display name instead of showing nothing.
+            let applet_name = if status.applet_name.is_empty() {
+                status.applet_fingerprint.applet_name().to_string()
+            } else {
+                status.applet_name.clone()
+            };
+
+            println!(
+                "Applet:      {} ({})",
+                applet_name, status.applet_fingerprint
+            );
             // Tolerant of any non-empty GET VERSION reply, not just real
             // Yubico firmware's 3 bytes — some third-party PIV applets that
             // answer this vendor extension at all use a different byte count
             // (observed: a Swissbit iShield Key 2 Pro replies with 4).
-            match status.version.as_deref() {
-                Some(v) => println!("Version:     {}", keyroost_piv::format_version_bytes(v)),
-                None => println!("Version:     (unavailable)"),
-            }
+            let version_str = status
+                .version
+                .as_deref()
+                .map(keyroost_piv::format_version_bytes)
+                .unwrap_or_else(|| "(unavailable)".to_string());
+            // `version_firmware` is the token's own firmware (read through a
+            // fingerprint-specific probe only some tokens answer — currently
+            // a Nitrokey only), not necessarily the same as the PIV applet's
+            // own version above; a
+            // dedicated line would repeat the applet version for every token
+            // that doesn't distinguish the two, so it's appended here instead
+            // — and only when it actually differs from the applet version.
+            let fw_suffix = status
+                .version_firmware
+                .as_deref()
+                .filter(|fw| Some(*fw) != status.version.as_deref())
+                .map(|fw| format!(" (FW v{})", keyroost_piv::format_version_bytes(fw)))
+                .unwrap_or_default();
+            println!("Version:     {version_str}{fw_suffix}");
             match status.serial {
                 Some(s) => println!("Serial:      {0} (0x{0:08X})", s),
                 None => println!("Serial:      (unavailable)"),
@@ -6599,8 +6661,10 @@ fn open_piv(
     let by_name = reader_from_name()?;
     let name = resolve_reader(readers, reader.or(by_name.as_deref()), "PIV")?;
     eprintln!("\u{2192} PIV on {}", sanitize_terminal(&name));
-    let mut session = keyroost_transport::PivSession::open(&name)?;
-    session.set_debug(debug);
+    // `open_with_debug`, not `open` + `set_debug` — the latter would miss
+    // the initial SELECT this constructor itself issues, since it happens
+    // before `set_debug` ever runs.
+    let session = keyroost_transport::PivSession::open_with_debug(&name, debug)?;
     Ok(session)
 }
 
@@ -10351,8 +10415,23 @@ mod cli_tests {
                 cert_present: true,
                 cert_len: 800,
             }],
+            applet_fingerprint: "YubiKey".into(),
+            applet_name: "YubiKey".into(),
+            version_firmware: Some("3.35.0".into()),
         };
-        assert_json_has_keys(&p, &["version", "serial", "pin_retries", "chuid", "slots"]);
+        assert_json_has_keys(
+            &p,
+            &[
+                "version",
+                "serial",
+                "pin_retries",
+                "chuid",
+                "slots",
+                "applet_fingerprint",
+                "applet_name",
+                "version_firmware",
+            ],
+        );
     }
 
     #[test]
