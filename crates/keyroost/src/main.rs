@@ -13789,7 +13789,9 @@ impl App {
                     .as_deref()
                     .map(keyroost_piv::format_version_bytes)
                     .unwrap_or_else(|| "\u{2014}".to_string());
-                let serial = st.serial.map_or("\u{2014}".to_string(), |s| s.to_string());
+                let serial = st
+                    .serial
+                    .map_or("\u{2014}".to_string(), keyroost_piv::format_serial_short);
                 let retries = st
                     .pin_retries
                     .map_or("\u{2014}".to_string(), |n| n.to_string());

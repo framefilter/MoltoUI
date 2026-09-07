@@ -1460,6 +1460,31 @@ pub fn parse_serial(buf: &[u8]) -> Result<u128, ParseError> {
     Ok(u128::from_be_bytes(widened))
 }
 
+/// Format a PIV serial for a text terminal: decimal with the hex form
+/// parenthesized, matching every serial observed so far (all of them fit
+/// 64 bits). Past 64 bits — currently only reachable via Nitrokey's own
+/// 128-bit admin serial command — the decimal expansion is unwieldy and no
+/// vendor prints a serial that large in decimal, so those display as hex
+/// alone, with no parenthetical.
+pub fn format_serial_long(serial: u128) -> String {
+    if serial > u128::from(u64::MAX) {
+        format!("0x{serial:X}")
+    } else {
+        format!("{serial} (0x{serial:08X})")
+    }
+}
+
+/// Format a PIV serial for a compact UI label: decimal for a serial that
+/// fits 64 bits, hex for one that doesn't — see [`format_serial_long`] for
+/// why.
+pub fn format_serial_short(serial: u128) -> String {
+    if serial > u128::from(u64::MAX) {
+        format!("0x{serial:X}")
+    } else {
+        serial.to_string()
+    }
+}
+
 /// Extract one inner TLV value (`inner_tag`) from a `0x7C` GENERAL AUTHENTICATE
 /// response template — the witness (`0x80`) from step 1, or the encrypted
 /// challenge / signature (`0x82`) from step 2 / signing.
@@ -1812,6 +1837,25 @@ mod tests {
         assert_eq!(parse_serial(&[]).unwrap(), 0);
         // 17 bytes can't fit a u128.
         assert!(parse_serial(&[0u8; 17]).is_err());
+    }
+
+    #[test]
+    fn format_serial_switches_to_hex_past_64_bits() {
+        assert_eq!(format_serial_long(12345678), "12345678 (0x00BC614E)");
+        assert_eq!(format_serial_short(12345678), "12345678");
+        // u64::MAX itself is still the decimal/hex-parenthesized form.
+        assert_eq!(
+            format_serial_long(u128::from(u64::MAX)),
+            "18446744073709551615 (0xFFFFFFFFFFFFFFFF)"
+        );
+        assert_eq!(
+            format_serial_short(u128::from(u64::MAX)),
+            "18446744073709551615"
+        );
+        // One past u64::MAX switches both forms to hex-only, no parenthetical.
+        let past_64_bits = u128::from(u64::MAX) + 1;
+        assert_eq!(format_serial_long(past_64_bits), "0x10000000000000000");
+        assert_eq!(format_serial_short(past_64_bits), "0x10000000000000000");
     }
 
     #[test]

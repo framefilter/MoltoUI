@@ -6192,7 +6192,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 .unwrap_or_default();
             println!("Version:     {version_str}{fw_suffix}");
             match status.serial {
-                Some(s) => println!("Serial:      {0} (0x{0:08X})", s),
+                Some(s) => println!("Serial:      {}", keyroost_piv::format_serial_long(s)),
                 None => println!("Serial:      (unavailable)"),
             }
             match status.pin_retries {
