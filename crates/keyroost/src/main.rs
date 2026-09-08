@@ -14022,9 +14022,11 @@ impl App {
             self.piv.retired_occupancy.as_deref(),
         );
         // Key deletion (Yubico MOVE/DELETE KEY) needs firmware 5.7+. The
-        // transport version-gates as a backstop; here we hide the button (and
-        // explain) when the loaded status reports an older — or unknown —
-        // version. Clearing a certificate works everywhere.
+        // transport version-gates as a backstop; here we still render the Move
+        // and Delete key buttons when the loaded status reports an older — or
+        // unknown — version, but dimmed and non-clickable with a hover reason,
+        // so the capability stays discoverable. Clearing a certificate works
+        // everywhere.
         let can_delete_key = matches!(
             self.piv.status.as_ref().and_then(|s| s.version.as_deref()),
             Some(v) if v >= [5, 7].as_slice()
@@ -14404,8 +14406,10 @@ impl App {
             // inside the Delete row, which put a deliberately non-destructive
             // action under a destructive heading and left it sharing the delete
             // help text — the one place a user checking "is this safe?" would
-            // look. Same 5.7+ gate as delete, plus a key in the active slot.
-            if can_delete_key && selected_has_key {
+            // look. Needs a key in the active slot to make sense at all; the
+            // 5.7+ firmware gate only dims the button (with a hover reason)
+            // rather than hiding the row, so the capability stays discoverable.
+            if selected_has_key {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Move key")
@@ -14415,8 +14419,13 @@ impl App {
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "piv-move");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
-                            open_move_key = true;
+                        if can_delete_key {
+                            if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
+                                open_move_key = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Move key\u{2026}")
+                                .on_hover_text("Moving keys between slots needs YubiKey 5.7+.");
                         }
                     });
                 });
@@ -14437,8 +14446,14 @@ impl App {
                         if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
                             open_delete_key = true;
                         }
-                        ui.add_space(6.0);
+                    } else {
+                        // Kept visible but dimmed on pre-5.7 firmware so the
+                        // action is discoverable; the hover text and the note
+                        // below both say why it can't run yet.
+                        theme::button_disabled(ui, p, "Delete key\u{2026}")
+                            .on_hover_text("Key deletion needs YubiKey 5.7+.");
                     }
+                    ui.add_space(6.0);
                     if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
                         .clicked()
                     {
