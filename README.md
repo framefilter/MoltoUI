@@ -197,6 +197,9 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   distro-neutrality disclaimer, install-command corrections and an intro
   rewrite ([#35](https://github.com/framefilter/keyroost/issues/35),
   [#45](https://github.com/framefilter/keyroost/issues/45)).
+- **[@MakeShiftArtist](https://github.com/MakeShiftArtist)** — the Nix flake:
+  `keyroost` and `keyroostctl` packages plus a development shell, tested on
+  x86_64 Linux ([#109](https://github.com/framefilter/keyroost/pull/109)).
 - **[@episource](https://github.com/episource)** — the project's most prolific
   external contributor: Nitrokey 3 PIV support and `piv new-chuid`
   ([#102](https://github.com/framefilter/keyroost/pull/102)), short-APDU
@@ -388,6 +391,19 @@ rules. Use any AUR helper (or `makepkg`):
 
 ```bash
 yay -S keyroost-bin
+```
+
+### Nix (flake)
+
+The repository is a flake exposing `keyroost` (the default package),
+`keyroostctl` and a development shell. Builds from source. Contributed and
+tested on x86_64 Linux; other systems are declared but unverified
+([#109](https://github.com/framefilter/keyroost/pull/109)).
+
+```bash
+nix run github:framefilter/keyroost            # GUI
+nix run github:framefilter/keyroost#keyroostctl -- --help
+nix profile install github:framefilter/keyroost
 ```
 
 ### winget (Windows)
