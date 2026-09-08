@@ -1485,28 +1485,6 @@ pub fn format_serial_short(serial: u128) -> String {
     }
 }
 
-/// Decode a serial that the device reports in BCD coding: each nibble of the
-/// raw serial reply holds one decimal digit of the number actually printed on
-/// the unit, so recovering the real serial means reading those nibbles
-/// most-significant first and accumulating `acc * 10 + nibble` rather than
-/// trusting the raw integer's own value. Apply this only to a serial from a
-/// device known to use BCD coding — BCD-decoding an ordinary integer serial
-/// would corrupt a perfectly good number. Fails safe: a nibble outside
-/// `0..=9` isn't a decimal digit, so the raw serial is returned unchanged
-/// rather than a bad conversion being forced through. (32 decimal digits max
-/// out below `u128::MAX`, so the accumulation cannot overflow.)
-pub fn decode_bcd_serial(serial: u128) -> u128 {
-    let mut decoded: u128 = 0;
-    for shift in (0..u128::BITS).step_by(4).rev() {
-        let nibble = (serial >> shift) & 0xF;
-        if nibble > 9 {
-            return serial;
-        }
-        decoded = decoded * 10 + nibble;
-    }
-    decoded
-}
-
 /// Extract one inner TLV value (`inner_tag`) from a `0x7C` GENERAL AUTHENTICATE
 /// response template — the witness (`0x80`) from step 1, or the encrypted
 /// challenge / signature (`0x82`) from step 2 / signing.
@@ -1878,24 +1856,6 @@ mod tests {
         let past_64_bits = u128::from(u64::MAX) + 1;
         assert_eq!(format_serial_long(past_64_bits), "0x10000000000000000");
         assert_eq!(format_serial_short(past_64_bits), "0x10000000000000000");
-    }
-
-    #[test]
-    fn decode_bcd_serial_reads_nibbles_as_decimal_digits() {
-        // Every nibble is a decimal digit: 0x1234 -> digits 1,2,3,4 -> 1234.
-        assert_eq!(decode_bcd_serial(0x1234), 1234);
-        // Leading zero nibbles just contribute nothing to the accumulator.
-        assert_eq!(decode_bcd_serial(0x0009_0009), 90009);
-        // A nibble outside 0-9 isn't a decimal digit, so the decode fails safe
-        // and the raw value passes through unchanged.
-        assert_eq!(decode_bcd_serial(0xABCD), 0xABCD);
-        // Zero round-trips trivially either way.
-        assert_eq!(decode_bcd_serial(0), 0);
-        // A full 32-nibble all-nines serial decodes without overflowing u128.
-        assert_eq!(
-            decode_bcd_serial(0x9999_9999_9999_9999_9999_9999_9999_9999),
-            99_999_999_999_999_999_999_999_999_999_999
-        );
     }
 
     #[test]

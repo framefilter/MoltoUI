@@ -390,7 +390,7 @@ pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
     Ok(guid)
 }
 
-/// Run [`keyroost_piv::decode_bcd_serial`] over `serial`, but only for applets
+/// Run [`crate::decode_bcd_serial`] over `serial`, but only for applets
 /// known to report their serial in BCD coding. Token2 is the only such device
 /// identified so far; others may be discovered and added here later. Every
 /// other vendor's serial is a plain integer already, and BCD-decoding one
@@ -403,7 +403,7 @@ fn decode_serial_if_bcd(
     let reports_bcd_serial =
         matches!(fingerprint, keyroost_piv::fingerprint::AppletFingerprint::Token2);
     if reports_bcd_serial {
-        serial.map(keyroost_piv::decode_bcd_serial)
+        serial.map(crate::decode_bcd_serial)
     } else {
         serial
     }
