@@ -1,6 +1,8 @@
-//! keyroostctl — CLI for programming Token2 Molto2 / Molto2v2 TOTP tokens.
+//! keyroostctl — CLI for managing hardware security keys: FIDO2, OATH,
+//! OpenPGP, PIV, and Token2 programmable TOTP tokens.
 //!
-//! Drop-in replacement for `molto2.py` with a cleaner subcommand layout.
+//! Started as a replacement for the Molto2 vendor script with a cleaner
+//! subcommand layout; each applet now has its own command group.
 
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};

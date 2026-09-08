@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "PC/SC transport for the Token2 Molto2 / Molto2v2 programmable TOTP token."
+description = "PC/SC transport and applet sessions for hardware security keys: Token2 Molto2, OATH, OpenPGP, PIV, and CCID serial lookup."
 
 [lints]
 workspace = true
