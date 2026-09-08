@@ -8,7 +8,7 @@ edition.workspace = true
 rust-version = "1.92"
 license.workspace = true
 repository.workspace = true
-description = "Desktop GUI for programming Token2 Molto2 / Molto2v2 TOTP tokens."
+description = "Desktop GUI for managing hardware security keys: FIDO2, OATH, OpenPGP, PIV, and Token2 programmable TOTP tokens."
 
 [lints]
 workspace = true

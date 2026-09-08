@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Command-line tool for programming Token2 Molto2 / Molto2v2 TOTP tokens."
+description = "Command-line tool for managing hardware security keys: FIDO2, OATH, OpenPGP, PIV, and Token2 programmable TOTP tokens."
 
 [lints]
 workspace = true

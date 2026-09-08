@@ -1,5 +1,5 @@
 {
-  description = "Vendor Neutral, Rust-Based Management UI and CLI for U2F/FIDO2 and other hardware security keys ";
+  description = "Independent, vendor-neutral GUI and CLI for managing hardware security keys (FIDO2, OATH, OpenPGP, PIV, Token2 TOTP tokens)";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -82,7 +82,7 @@
               '';
 
               meta = {
-                description = "Desktop GUI for programming Token2 Molto2 / Molto2v2 TOTP tokens.";
+                description = keyroostCargo.package.description;
                 homepage = "https://github.com/framefilter/keyroost";
                 license = with pkgs.lib.licenses; [
                   mit
@@ -120,7 +120,7 @@
               '';
 
               meta = {
-                description = "Command-line tool for programming Token2 Molto2 / Molto2v2 TOTP tokens.";
+                description = keyroostctlCargo.package.description;
                 homepage = "https://github.com/framefilter/keyroost";
                 license = with pkgs.lib.licenses; [
                   mit

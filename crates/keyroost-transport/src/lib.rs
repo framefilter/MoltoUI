@@ -1,8 +1,10 @@
-//! PC/SC transport for the Token2 Molto2.
+//! PC/SC transport and applet sessions for hardware security keys.
 //!
-//! This crate is the bridge between `keyroost-proto` (pure byte builders) and
-//! the real device. It handles reader discovery, APDU exchange, and the
-//! challenge-response auth handshake.
+//! This crate is the bridge between the pure byte-layer crates
+//! (`keyroost-proto`, `keyroost-oath`, `keyroost-openpgp`, `keyroost-piv`)
+//! and the real device. It handles reader discovery, APDU exchange, and the
+//! per-applet sessions — the Molto2 challenge-response auth handshake below,
+//! plus the OATH, OpenPGP and PIV sessions in their own modules.
 //!
 //! ```no_run
 //! use keyroost_transport::{Session, TransportError};
