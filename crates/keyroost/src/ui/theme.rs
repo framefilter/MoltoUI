@@ -425,6 +425,26 @@ pub fn button_disabled(ui: &mut egui::Ui, p: &Palette, label: &str) -> Response 
     resp
 }
 
+/// A small ⚠ glyph in the warning colour that senses hover, so the caller can
+/// hang an `.on_hover_text(…)` on the returned [`Response`]. For flagging a
+/// control that stays usable but carries a caveat — e.g. a non-standard
+/// command whose support on the connected device is unverified — next to
+/// [`button`] rather than dimming it with [`button_disabled`].
+pub fn warn_marker(ui: &mut egui::Ui, p: &Palette) -> Response {
+    let resp = ui.add(
+        egui::Label::new(
+            egui::RichText::new("\u{26A0}")
+                .font(f_sb(13.0))
+                .color(p.warn),
+        )
+        .sense(egui::Sense::hover()),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Help);
+    }
+    resp
+}
+
 /// Like [`button`], but reserves room for a small icon on the left, inside the
 /// button. Returns the response and the center point at which the caller should
 /// paint the icon (using the returned foreground color), so the icon and label

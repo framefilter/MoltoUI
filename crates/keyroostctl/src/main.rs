@@ -1042,10 +1042,15 @@ enum PivCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Delete a slot's private key (Yubico extension; needs YubiKey firmware
-    /// 5.7 or newer). Permanently erases the key material — the certificate
-    /// object is left in place. Needs the management key. DESTRUCTIVE: requires
-    /// `--yes`. Older cards cannot delete a key; overwrite the slot instead.
+    /// Delete a slot's private key (Yubico extension). Permanently erases the
+    /// key material — the certificate object is left in place. Needs the
+    /// management key. DESTRUCTIVE: requires `--yes`.
+    ///
+    /// Key deletion needs YubiKey 5.7+ or a compatible third-party device. A
+    /// per-fingerprint white/blacklist decides up front: on a device known to
+    /// be incompatible it is refused (pass `--force` to run anyway), on an
+    /// unverified device it runs with a warning that it may fail, and on a
+    /// known-good device it just runs.
     DeleteKey {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1057,10 +1062,18 @@ enum PivCmd {
         mgmt_key_stdin: bool,
         #[arg(long)]
         yes: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
-    /// Move a slot's private key to another slot (Yubico MOVE KEY, fw 5.7+).
+    /// Move a slot's private key to another slot (Yubico MOVE KEY).
     /// Non-destructive; refuses an occupied destination. The certificate stays
     /// in the source slot.
+    ///
+    /// Moving keys between slots needs YubiKey 5.7+ or a compatible third-party
+    /// device. The same per-fingerprint white/blacklist as `delete-key`
+    /// applies: refused on a device known to be incompatible unless `--force`,
+    /// run-with-warning on an unverified one, silent on a known-good one.
     MoveKey {
         /// Source slot (9a/9c/9d/9e/82–95).
         #[arg(long)]
@@ -1075,6 +1088,9 @@ enum PivCmd {
         mgmt_key_env: Option<String>,
         #[arg(long)]
         mgmt_key_stdin: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -6598,6 +6614,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_env,
             mgmt_key_stdin,
             yes,
+            force,
         } => {
             if !yes {
                 return Err(format!(
@@ -6608,7 +6625,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 .into());
             }
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            // Gate on the applet's fingerprint before authenticating — the
+            // fingerprint probe re-SELECTs PIV and would clear the auth.
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            guard_piv_feature(
+                &mut s,
+                keyroost_piv::compat::PivExtension::DeleteKey,
+                *force,
+            )?;
+            authenticate_piv(&mut s, &mgmt)?;
             s.delete_key(slot.to_slot())?;
             println!(
                 "Deleted the private key in {} (the certificate object, if any, remains).",
@@ -6622,9 +6647,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             mgmt_key_env,
             mgmt_key_stdin,
+            force,
         } => {
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            guard_piv_feature(&mut s, keyroost_piv::compat::PivExtension::MoveKey, *force)?;
+            authenticate_piv(&mut s, &mgmt)?;
             s.move_key(from.to_slot(), to.to_slot())?;
             println!(
                 "moved the private key {} \u{2192} {}; the certificate remains in {}",
@@ -6668,15 +6696,28 @@ fn open_piv(
     Ok(session)
 }
 
-/// [`open_piv`], then authenticate the management key against the card's own
-/// algorithm — with a friendly wrong-length message *before* the card sees
-/// anything, instead of a bare transport error afterwards.
+/// [`open_piv`], then [`authenticate_piv`].
 fn open_piv_authed(
     reader: Option<&str>,
     debug: bool,
     mgmt_key: &[u8],
 ) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
     let mut session = open_piv(reader, debug)?;
+    authenticate_piv(&mut session, mgmt_key)?;
+    Ok(session)
+}
+
+/// Authenticate the management key on an already-open [`PivSession`] against
+/// the card's own algorithm — with a friendly wrong-length message *before*
+/// the card sees anything, instead of a bare transport error afterwards.
+///
+/// Split from [`open_piv_authed`] so a caller can do work on the plain session
+/// first (e.g. [`guard_piv_feature`], which must run before auth because its
+/// fingerprint probe re-SELECTs PIV and clears the auth state).
+fn authenticate_piv(
+    session: &mut keyroost_transport::PivSession,
+    mgmt_key: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     // Prefer GET METADATA; when the card stubs it out, probe every GENERAL
     // AUTHENTICATE P1 with a witness request and narrow by key length, rather
     // than blindly assuming 3DES.
@@ -6709,7 +6750,49 @@ fn open_piv_authed(
             })?,
     };
     session.authenticate_management(alg, mgmt_key)?;
-    Ok(session)
+    Ok(())
+}
+
+/// Apply the per-fingerprint white/blacklist ([`keyroost_piv::compat`]) to one
+/// of the Yubico vendor-extension operations before it runs, mirroring the
+/// GUI's three-way gate and reusing its exact wording
+/// ([`keyroost_piv::compat::PivExtension::requirement`] plus a state suffix):
+///
+/// * whitelisted → run, no output;
+/// * unverified → warn `<requirement> <UNVERIFIED_SUFFIX>`, then run;
+/// * blacklisted → fail with `<requirement> <INCOMPATIBLE_SUFFIX> Pass --force
+///   to run anyway.`; with `force`, downgrade that to the same kind of warning
+///   and run.
+///
+/// Must be called on the session **before** management-key auth — it runs a
+/// fingerprint probe that re-SELECTs PIV.
+fn guard_piv_feature(
+    session: &mut keyroost_transport::PivSession,
+    extension: keyroost_piv::compat::PivExtension,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_piv::compat::FeatureGate;
+    let needs = extension.requirement();
+    match session.feature_gate(extension) {
+        FeatureGate::Supported => {}
+        FeatureGate::Unverified => {
+            eprintln!("warning: {needs} {}", FeatureGate::UNVERIFIED_SUFFIX);
+        }
+        FeatureGate::Unsupported if force => {
+            eprintln!(
+                "warning: {needs} {} Running anyway because --force was given.",
+                FeatureGate::INCOMPATIBLE_SUFFIX
+            );
+        }
+        FeatureGate::Unsupported => {
+            return Err(format!(
+                "{needs} {} Pass --force to run anyway.",
+                FeatureGate::INCOMPATIBLE_SUFFIX
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// The `--generate-key` convenience shared by `piv request-cert` / `piv
@@ -10051,12 +10134,58 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::MoveKey { from, to, .. },
+                cmd: PivCmd::MoveKey {
+                    from, to, force, ..
+                },
             }) => {
                 assert_eq!(from.to_slot().key_ref(), 0x9D);
                 assert_eq!(to.to_slot().key_ref(), 0x82);
+                // --force is opt-in; absent here.
+                assert!(!force);
             }
             _ => panic!("expected piv move-key"),
+        }
+    }
+
+    #[test]
+    fn piv_key_ops_take_force_flag() {
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "move-key",
+            "--from",
+            "9d",
+            "--to",
+            "82",
+            "--force",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::MoveKey { force, .. },
+            }) => assert!(force),
+            _ => panic!("expected piv move-key"),
+        }
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "delete-key",
+            "--slot",
+            "9a",
+            "--yes",
+            "--force",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::DeleteKey { force, yes, .. },
+            }) => {
+                assert!(force);
+                assert!(yes);
+            }
+            _ => panic!("expected piv delete-key"),
         }
     }
 

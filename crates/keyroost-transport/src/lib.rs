@@ -140,9 +140,6 @@ pub enum TransportError {
     /// *accepted*: RESET RETRY COUNTER really ran, so the card's PIN was
     /// rewritten to a known value and unblocked.
     PivPukGuessAccepted,
-    /// A PIV operation needs a newer firmware than the card reports. Carries the
-    /// human-readable operation that was attempted.
-    PivFirmwareTooOld(&'static str),
     /// A PIV MOVE KEY refused because the destination slot already holds a key
     /// (GET METADATA pre-check, ahead of the card's own refusal).
     PivDestinationOccupied(keyroost_piv::Slot),
@@ -295,9 +292,6 @@ impl fmt::Display for TransportError {
                  (`keyroostctl piv change-pin`) before running the factory reset \
                  again."
             ),
-            TransportError::PivFirmwareTooOld(op) => {
-                write!(f, "{}", op)
-            }
             TransportError::PivDestinationOccupied(slot) => write!(
                 f,
                 "slot {} already holds a key — delete it first or pick an empty slot",

@@ -23,6 +23,7 @@
 use keyroost_proto::apdu::{build_apdu, build_apdu_get};
 use zeroize::Zeroizing;
 
+pub mod compat;
 pub mod fingerprint;
 pub mod spki;
 pub mod x509;
@@ -1420,10 +1421,10 @@ pub fn unwrap_data_object(buf: &[u8]) -> Result<&[u8], ParseError> {
 }
 
 /// Format a Yubico `GET VERSION` reply for display — tolerant of any
-/// non-empty length. Feature gates on the transport side (`move_key_supported`
-/// et al.) compare the same raw bytes directly as a slice rather than parsing
-/// them into a fixed-width tuple first, so there's no separate strict parse
-/// to defer to here either. Up to 4 bytes still reads as a version number, so
+/// non-empty length. The feature white/blacklist ([`compat::resolve`])
+/// compares the same raw bytes directly as a slice rather than parsing them
+/// into a fixed-width tuple first, so there's no separate strict parse to
+/// defer to here either. Up to 4 bytes still reads as a version number, so
 /// it's dot-joined as decimal (`major.minor.patch[...]`, covering both real
 /// Yubico firmware's 3 bytes and small vendor variants like a 4-byte reply
 /// observed from a Swissbit OpenFIPS201 build). Past 4 bytes, dot-joining

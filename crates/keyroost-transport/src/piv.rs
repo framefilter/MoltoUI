@@ -134,9 +134,9 @@ pub struct PivStatus {
     /// Pro, an OpenFIPS201 build, answering `9000` with 4 bytes that don't
     /// trace back to anything in OpenFIPS201's own source), so a reply here
     /// means "answers this Yubico extension," not "is a YubiKey." `None` if
-    /// the card doesn't answer it, or answers empty. Feature gates (e.g.
-    /// [`move_key_supported`]) compare this directly as a byte slice rather
-    /// than requiring an exact 3-byte shape. See
+    /// the card doesn't answer it, or answers empty. [`Self::feature_gate`]
+    /// (via [`keyroost_piv::compat`]) compares this directly as a byte slice
+    /// rather than requiring an exact 3-byte shape. See
     /// [`keyroost_piv::format_version_bytes`] for display formatting.
     pub version: Option<Vec<u8>>,
     /// The applet's own firmware version, when a specific fingerprint's probe
@@ -321,21 +321,6 @@ impl PubkeyCache {
     }
 }
 
-/// Whether MOVE KEY is available given the reported firmware version — fw
-/// 5.7+ (Yubico). Compared as a plain byte slice, not a fixed 3-part tuple:
-/// [`PivStatus::version`] isn't guaranteed to be exactly 3 bytes, and slice
-/// order gets a length mismatch right on its own (`[5, 7] < [5, 7, 0] <
-/// [5, 7, 1] < [5, 8]`), so `[5, 7]` alone is a correct "5.7 or newer"
-/// threshold without needing a trailing zero. Unknown version → allow the
-/// attempt; the card refuses if it truly can't (belt-and-suspenders with the
-/// pre-check).
-fn move_key_supported(version: Option<&[u8]>) -> bool {
-    match version {
-        Some(v) => v >= [5, 7].as_slice(),
-        None => true,
-    }
-}
-
 /// The management-key algorithms whose key is exactly `key_len` bytes, 3DES
 /// first. Empty when no algorithm uses that length.
 ///
@@ -400,8 +385,10 @@ fn decode_serial_if_bcd(
     fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
     serial: Option<u128>,
 ) -> Option<u128> {
-    let reports_bcd_serial =
-        matches!(fingerprint, keyroost_piv::fingerprint::AppletFingerprint::Token2);
+    let reports_bcd_serial = matches!(
+        fingerprint,
+        keyroost_piv::fingerprint::AppletFingerprint::Token2
+    );
     if reports_bcd_serial {
         serial.map(crate::decode_bcd_serial)
     } else {
@@ -759,6 +746,29 @@ impl PivSession {
         })
     }
 
+    /// Resolve the per-fingerprint white/blacklist ([`keyroost_piv::compat`])
+    /// for one of the vendor-extension operations this session exposes
+    /// ([`Self::move_key`], [`Self::delete_key`]), from the applet's own
+    /// fingerprint and reported version.
+    ///
+    /// Purely advisory: neither `move_key` nor `delete_key` version-gates
+    /// itself any more (an unsupported card refuses the APDU on its own). A
+    /// caller that wants to warn — or refuse — *before* the card sees the
+    /// command calls this and acts on the [`FeatureGate`]. It runs the same
+    /// fingerprint probes as [`Self::status`] and re-SELECTs PIV at the end,
+    /// which clears any management-key authentication, so call it **before**
+    /// [`Self::authenticate_management`].
+    ///
+    /// [`FeatureGate`]: keyroost_piv::compat::FeatureGate
+    pub fn feature_gate(
+        &mut self,
+        feature: keyroost_piv::compat::PivExtension,
+    ) -> keyroost_piv::compat::FeatureGate {
+        let version = self.version();
+        let (fingerprint, ..) = self.applet_fingerprint(version.as_deref());
+        keyroost_piv::compat::resolve(feature, fingerprint, version.as_deref())
+    }
+
     /// [`Self::status`] plus each slot's key algorithm, certificate Subject
     /// DN, and PIN/touch policy — the full per-slot view a status pane draws.
     ///
@@ -835,10 +845,10 @@ impl PivSession {
     /// Yubico's proprietary GET VERSION extension (`INS FD`), raw reply
     /// bytes, tolerant of any non-empty length — see [`PivStatus::version`]
     /// for why. `None` if the command errors, the card answers a non-`9000`
-    /// status, or the reply is empty. Feature gates (`move_key_supported`,
-    /// the `new_enough` check in [`Self::delete_key`]) call this directly and
-    /// compare the raw bytes as a slice, rather than requiring an exact
-    /// 3-byte shape like real Yubico firmware's.
+    /// status, or the reply is empty. [`Self::feature_gate`] passes the raw
+    /// bytes straight to [`keyroost_piv::compat::resolve`], which compares
+    /// them as a slice rather than requiring an exact 3-byte shape like real
+    /// Yubico firmware's.
     fn version(&mut self) -> Option<Vec<u8>> {
         let (data, sw) = self.transmit_full(&piv::get_version()).ok()?;
         (sw == piv::SW_OK && !data.is_empty()).then_some(data)
@@ -1280,23 +1290,14 @@ impl PivSession {
     }
 
     /// Delete `slot`'s private key (Yubico MOVE-to-`0xFF` extension). Permanently
-    /// erases the key material; the certificate object is untouched. Requires
-    /// YubiKey firmware 5.7+ **and** prior management-key auth
-    /// ([`authenticate_management`]). Cards older than 5.7 cannot delete a key —
-    /// the only recovery there is to overwrite the slot.
+    /// erases the key material; the certificate object is untouched. This is a
+    /// Yubico vendor extension (YubiKey firmware 5.7+); it is **not**
+    /// version-gated here — a card that doesn't implement it refuses the APDU,
+    /// and [`Self::feature_gate`] is the way to check ahead of that. Requires
+    /// prior management-key auth ([`authenticate_management`]).
     ///
     /// [`authenticate_management`]: PivSession::authenticate_management
     pub fn delete_key(&mut self, slot: Slot) -> Result<(), TransportError> {
-        // Version-gate: MOVE/DELETE KEY landed in YubiKey firmware 5.7.
-        // Compared as a byte slice, not a fixed 3-part tuple — see
-        // `move_key_supported`'s doc for why `[5, 7]` alone is the right
-        // threshold.
-        let new_enough = matches!(self.version(), Some(v) if v.as_slice() >= [5, 7].as_slice());
-        if !new_enough {
-            return Err(TransportError::PivFirmwareTooOld(
-                "deleting a key requires YubiKey firmware 5.7 or newer (older cards can only overwrite the slot)",
-            ));
-        }
         let (_, sw) = self.transmit_full(&piv::delete_key(slot))?;
         ok_or_write("piv delete key", sw)?;
         self.pubkey_cache.evict(slot.key_ref());
@@ -1594,11 +1595,15 @@ impl PivSession {
     }
 
     /// Relocate a slot's private key to another slot (Yubico MOVE KEY). Refuses
-    /// a same-slot move, firmware below 5.7, and an occupied destination
-    /// (GET METADATA pre-check — the card also refuses, this gives a clear error
-    /// first). Moves ONLY the key; the source slot's certificate stays put.
-    /// Requires prior management-key auth ([`authenticate_management`]), same
-    /// as [`delete_key`].
+    /// a same-slot move and an occupied destination (GET METADATA pre-check —
+    /// the card also refuses, this gives a clear error first). Moves ONLY the
+    /// key; the source slot's certificate stays put. Requires prior
+    /// management-key auth ([`authenticate_management`]), same as
+    /// [`delete_key`].
+    ///
+    /// This is a Yubico vendor extension (YubiKey firmware 5.7+) and is
+    /// **not** version-gated here — an older card refuses the APDU itself.
+    /// Use [`Self::feature_gate`] to check ahead of that.
     ///
     /// [`authenticate_management`]: PivSession::authenticate_management
     /// [`delete_key`]: PivSession::delete_key
@@ -1606,11 +1611,6 @@ impl PivSession {
         if src.key_ref() == dest.key_ref() {
             return Err(TransportError::MalformedResponse(
                 "source and destination slots are the same",
-            ));
-        }
-        if !move_key_supported(self.version().as_deref()) {
-            return Err(TransportError::PivFirmwareTooOld(
-                "moving a key requires YubiKey firmware 5.7 or newer",
             ));
         }
         if self.slot_has_key(dest)? {
@@ -2278,22 +2278,6 @@ mod tests {
             describe_apdu(&piv::select_by_aid(&[0xA0, 0x00, 0x00, 0x00, 0x03])),
             "SELECT"
         );
-    }
-
-    #[test]
-    fn move_key_firmware_gate() {
-        // MOVE KEY needs fw 5.7+. Below that -> refuse.
-        assert!(!move_key_supported(Some(&[5, 6, 0])));
-        assert!(move_key_supported(Some(&[5, 7, 0])));
-        assert!(move_key_supported(Some(&[5, 7, 4])));
-        assert!(move_key_supported(Some(&[6, 0, 0])));
-        // A bare [5, 7] itself clears the bar too — slice order puts a
-        // shorter-but-otherwise-equal reply below anything with a 3rd byte,
-        // not above it (`[5, 7] < [5, 7, 0]`), so the threshold has to be
-        // written as [5, 7] rather than [5, 7, 0] to include it.
-        assert!(move_key_supported(Some(&[5, 7])));
-        // Unknown version -> allow the attempt (card will reject if unsupported).
-        assert!(move_key_supported(None));
     }
 
     #[test]

@@ -6948,9 +6948,10 @@ impl App {
     }
 
     /// Permanently delete (erase) the private key in the selected slot.
-    /// Management-key authorized. Needs YubiKey firmware 5.7+; the transport
-    /// version-gates and surfaces `PivFirmwareTooOld` as the error on older
-    /// cards (the pane also hides the button below 5.7 — this is the backstop).
+    /// Management-key authorized. DELETE KEY is a Yubico extension (fw 5.7+);
+    /// the slot panel resolves `keyroost_piv::compat` into a three-way gate
+    /// (enable / warn / dim), and an unsupported card refuses the APDU itself
+    /// — the transport no longer version-gates.
     fn piv_delete_key(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
@@ -13717,6 +13718,7 @@ impl App {
 
     /// PIV tab — read-only status snapshot (auto-read on first view).
     fn cap_piv(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        use keyroost_piv::compat::{FeatureGate, PivExtension};
         if !self.piv_tried && !self.busy() {
             self.piv_tried = true;
             self.load_piv_status(LogKind::Background);
@@ -14021,15 +14023,51 @@ impl App {
             &self.piv.slot_keys,
             self.piv.retired_occupancy.as_deref(),
         );
-        // Key deletion (Yubico MOVE/DELETE KEY) needs firmware 5.7+. The
-        // transport version-gates as a backstop; here we still render the Move
-        // and Delete key buttons when the loaded status reports an older — or
-        // unknown — version, but dimmed and non-clickable with a hover reason,
-        // so the capability stays discoverable. Clearing a certificate works
-        // everywhere.
-        let can_delete_key = matches!(
-            self.piv.status.as_ref().and_then(|s| s.version.as_deref()),
-            Some(v) if v >= [5, 7].as_slice()
+        // Move key / Delete key are Yubico extensions (MOVE/DELETE KEY), not
+        // SP 800-73-4. `keyroost_piv::compat` resolves a per-fingerprint
+        // white/blacklist against the applet's reported version into a
+        // three-way gate: enable, enable-but-flag (support unverified on this
+        // device), or dim. An unsupported card refuses the APDU on its own —
+        // there is no transport-side version gate any more. Clearing a
+        // certificate is standard PIV and works everywhere.
+        let (piv_fp, piv_ver) = self.piv.status.as_ref().map_or(
+            (keyroost_piv::fingerprint::AppletFingerprint::Generic, None),
+            |s| (s.applet_fingerprint, s.version.as_deref()),
+        );
+        let move_key_gate = keyroost_piv::compat::resolve(PivExtension::MoveKey, piv_fp, piv_ver);
+        let delete_key_gate =
+            keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver);
+        // Explanations for the non-standard slot operations when the
+        // fingerprint white/blacklist can't clear them — built from the shared
+        // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
+        // same thing: the extension's `requirement()` sentence, then a state
+        // suffix. Each string is shown in two lockstep places: the hover on
+        // the marker by the row's help dot (a \u{26a0} for Unverified, the
+        // dimmed button for Unsupported) and the always-visible summary line
+        // at the foot of the card. "Key deletion" / "Moving keys" keep each
+        // distinct from the Delete row's other button, "Delete
+        // certificate\u{2026}" — and the Delete-key \u{26a0} hover additionally
+        // appends that "Delete certificate" is standard PIV and unaffected,
+        // which the terser foot-of-card line omits (see the hover call site).
+        let move_key_unverified_hint = format!(
+            "{} {}",
+            PivExtension::MoveKey.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let move_key_blocked_hint = format!(
+            "{} {}",
+            PivExtension::MoveKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        let delete_key_unverified_hint = format!(
+            "{} {}",
+            PivExtension::DeleteKey.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let delete_key_blocked_hint = format!(
+            "{} {}",
+            PivExtension::DeleteKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
         );
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab, exactly like the FIDO2 sub-tab strip
@@ -14418,14 +14456,29 @@ impl App {
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "piv-move");
+                    // Support-unverified warning sits right after the help dot,
+                    // by the operation's own explanation — not out by the
+                    // button.
+                    if matches!(move_key_gate, FeatureGate::Unverified) {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if can_delete_key {
-                            if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
-                                open_move_key = true;
+                        match move_key_gate {
+                            // Unverified still runs — the card refuses if it
+                            // truly can't — so the button stays live; only the
+                            // warning above marks the doubt.
+                            FeatureGate::Supported | FeatureGate::Unverified => {
+                                if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}")
+                                    .clicked()
+                                {
+                                    open_move_key = true;
+                                }
                             }
-                        } else {
-                            theme::button_disabled(ui, p, "Move key\u{2026}")
-                                .on_hover_text("Moving keys between slots needs YubiKey 5.7+.");
+                            FeatureGate::Unsupported => {
+                                theme::button_disabled(ui, p, "Move key\u{2026}")
+                                    .on_hover_text(move_key_blocked_hint.as_str());
+                            }
                         }
                     });
                 });
@@ -14441,17 +14494,36 @@ impl App {
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-delete");
+                // Support-unverified warning for "Delete key" sits here, beside
+                // the row's help dot — not out by the button — so its hover
+                // text names "Delete key" explicitly and, unlike the terser
+                // foot-of-card line, spells out that "Delete certificate" (the
+                // other button on this row) is standard PIV and unaffected.
+                if matches!(delete_key_gate, FeatureGate::Unverified) {
+                    ui.add_space(4.0);
+                    theme::warn_marker(ui, p).on_hover_text(format!(
+                        "{delete_key_unverified_hint} \u{201c}Delete certificate\u{201d} is \
+                         standard PIV and unaffected."
+                    ));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if can_delete_key {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
-                            open_delete_key = true;
+                    match delete_key_gate {
+                        // Unverified still runs — the card refuses if it truly
+                        // can't — so the button stays live; only the warning by
+                        // the help dot marks the doubt.
+                        FeatureGate::Supported | FeatureGate::Unverified => {
+                            if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked()
+                            {
+                                open_delete_key = true;
+                            }
                         }
-                    } else {
-                        // Kept visible but dimmed on pre-5.7 firmware so the
-                        // action is discoverable; the hover text and the note
-                        // below both say why it can't run yet.
-                        theme::button_disabled(ui, p, "Delete key\u{2026}")
-                            .on_hover_text("Key deletion needs YubiKey 5.7+.");
+                        FeatureGate::Unsupported => {
+                            // Kept visible but dimmed on pre-5.7 firmware so the
+                            // action is discoverable; the hover text and the
+                            // foot-of-card line both say why it can't run yet.
+                            theme::button_disabled(ui, p, "Delete key\u{2026}")
+                                .on_hover_text(delete_key_blocked_hint.as_str());
+                        }
                     }
                     ui.add_space(6.0);
                     if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
@@ -14461,9 +14533,37 @@ impl App {
                     }
                 });
             });
-            if !can_delete_key {
+            // Foot-of-card summary of every non-standard slot operation the
+            // fingerprint white/blacklist couldn't clear — one line each,
+            // matching the hover text on that row's warning marker (Unverified)
+            // or dimmed button (Unsupported), minus the Delete-key hover's
+            // trailing "Delete certificate is unaffected" aside. "Move key"
+            // only has a row when the slot holds a key, so its line is gated
+            // the same way.
+            for (shown, gate, unverified_line, blocked_line) in [
+                (
+                    selected_has_key,
+                    move_key_gate,
+                    move_key_unverified_hint.as_str(),
+                    move_key_blocked_hint.as_str(),
+                ),
+                (
+                    true,
+                    delete_key_gate,
+                    delete_key_unverified_hint.as_str(),
+                    delete_key_blocked_hint.as_str(),
+                ),
+            ] {
+                if !shown {
+                    continue;
+                }
+                let line = match gate {
+                    FeatureGate::Supported => continue,
+                    FeatureGate::Unverified => unverified_line,
+                    FeatureGate::Unsupported => blocked_line,
+                };
                 ui.add_space(4.0);
-                note(ui, "Key deletion needs YubiKey 5.7+.");
+                note(ui, line);
             }
         });
         ui.add_space(12.0);
