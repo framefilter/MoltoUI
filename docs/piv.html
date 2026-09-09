@@ -126,8 +126,8 @@
         request (CSR)</strong> for a certificate authority — signed by the card itself, the
         private key never leaves it — imports and exports certificates, changes the PIN,
         PUK, retry counts and management key, moves a key between slots, clears a slot's
-        certificate or key, writes a fresh CHUID, and resets
-        the applet. The same controls are in the desktop app's PIV pane.</p>
+        certificate or key, tests that a slot's key still works, writes a fresh CHUID, and
+        resets the applet. The same controls are in the desktop app's PIV pane.</p>
     </div>
 <pre><code>keyroostctl piv status
 keyroostctl piv generate-key --slot 9a --algorithm eccp256 --mgmt-key-stdin
@@ -163,6 +163,32 @@ keyroostctl piv delete-key  --slot 9a --mgmt-key-stdin --yes   # YubiKey 5.7+</c
       desktop app offers the same thing as <strong>Move key…</strong>.</p>
 <pre><code>keyroostctl piv move-key --from 9d --to 82 --mgmt-key-stdin   # archive a rotated key
 keyroostctl piv move-key --from 82 --to 9d --mgmt-key-stdin   # bring it back</code></pre>
+    <span id="test"></span>
+    <p><strong>Testing a slot's key.</strong> <code>test</code> proves a slot's private key
+      still works end to end, without changing anything on the card. keyroost reads the
+      slot's certificate, takes its public key, and builds a fixed challenge from it; the
+      card then runs every private-key operation the key's algorithm supports and keyroost
+      verifies each result against that same public key. The operations depend on the key
+      type — <strong>decrypt</strong> for RSA, <strong>key-agree</strong> (ECDH) for
+      P-256&nbsp;/&nbsp;P-384&nbsp;/&nbsp;X25519, and <strong>sign</strong> for
+      RSA&nbsp;/&nbsp;ECDSA&nbsp;/&nbsp;Ed25519 — and an operation the key can't do is
+      reported as <em>skipped</em>, not failed. It needs the PIN unless the slot's PIN
+      policy is <code>never</code> (typically <code>9E</code>), in which case leave the PIN
+      flags off; a PIN-per-use slot such as <code>9C</code> is re-verified before each
+      operation. The challenge is deterministic — sliced from one built-in constant — so a
+      run is fully reproducible and pulls in no randomness. The desktop app offers the same
+      thing as <strong>Test…</strong> in the slot pane, just below Delete; the button is
+      live only when the slot holds a certificate with a key type keyroost can test.</p>
+<pre><code>keyroostctl piv test --slot 9a --pin-stdin
+keyroostctl piv test --slot 9e                 # PIN policy "never" — omit the PIN
+keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
+    <p class="kr-muted">The command prints one line per operation —
+      <code>decrypt: passed</code>, <code>sign: FAILED — …</code>,
+      <code>key-agree: skipped — not supported for …</code> — and exits non-zero if any
+      operation failed. With <code>--json</code> it emits
+      <code>{ slot, algorithm, ok, operations: [ { operation, result } … ] }</code> instead.
+      A slot with no certificate, or a key type keyroost can't verify, is an error — nothing
+      is tested.</p>
     <span id="new-chuid"></span>
     <p><strong>Writing a new CHUID.</strong> <code>new-chuid</code> writes a fresh Card Holder
       Unique Identifier with a randomly-generated GUID (or one you supply with
