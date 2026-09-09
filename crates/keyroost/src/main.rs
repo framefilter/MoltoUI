@@ -14343,10 +14343,16 @@ impl App {
                 300.0,
             );
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Valid for")
-                        .font(theme::f_reg(13.0))
-                        .color(p.txt2),
+                // Same 96px label column `text_field` uses for the "Name" row
+                // above, so this label lines up with it and the input below
+                // starts at the same x.
+                ui.add_sized(
+                    [96.0, 22.0],
+                    egui::Label::new(
+                        egui::RichText::new("Valid for")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt2),
+                    ),
                 );
                 ui.add(
                     egui::DragValue::new(&mut self.piv.cert_days)
