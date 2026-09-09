@@ -14381,38 +14381,21 @@ impl App {
             });
 
             ui.add_space(12.0);
-            // --- Import cert: one button. It opens a file picker; picking a
-            // file then opens the management-key modal and the import runs on
-            // submit (see `drain_file_dialogs`).
+            // --- Import / Export cert: both buttons on one right-aligned row,
+            // "Import certificate" then "Export certificate". Import opens a
+            // file picker then the management-key modal; Export opens a save
+            // dialog and writes straight to the chosen path — no secret (see
+            // `drain_file_dialogs`). Export dims when the slot holds no cert.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Import cert")
+                    egui::RichText::new("Import/Export cert")
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-import");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
-                        .clicked()
-                    {
-                        open_import = true;
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            // --- Export cert: one button. It opens a save dialog and the
-            // certificate is written straight to the chosen path — no secret
-            // needed (see `drain_file_dialogs`).
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Export cert")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-export");
+                self.help_dot(ui, p, "piv-import-export");
+                // right_to_left: add "Export" first so it sits at the far
+                // right, then "Import" to its left.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if selected_has_cert {
                         if theme::button(ui, p, BtnKind::Default, "Export certificate\u{2026}")
@@ -14423,6 +14406,12 @@ impl App {
                     } else {
                         theme::button_disabled(ui, p, "Export certificate\u{2026}")
                             .on_hover_text(no_slot_cert_hint);
+                    }
+                    ui.add_space(8.0);
+                    if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
+                        .clicked()
+                    {
+                        open_import = true;
                     }
                 });
             });
