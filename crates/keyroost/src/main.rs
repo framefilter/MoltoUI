@@ -1350,6 +1350,11 @@ enum PivCredKind {
     DeleteKey,
     MoveKey,
     NewChuid,
+    /// Run every key self-test the selected slot's algorithm supports
+    /// (decrypt / key-agree / sign, in that order). Needs the PIN (unless the
+    /// slot's PIN policy is `never`); no management key, and nothing on the
+    /// card changes.
+    SelfTest,
 }
 
 impl PivCredKind {
@@ -1369,6 +1374,7 @@ impl PivCredKind {
             PivCredKind::DeleteKey => "Delete key",
             PivCredKind::MoveKey => "Move key",
             PivCredKind::NewChuid => "New CHUID",
+            PivCredKind::SelfTest => "Key self-test",
         }
     }
     /// Label for the modal's primary Submit button. Shorter than the title for
@@ -1385,6 +1391,7 @@ impl PivCredKind {
             PivCredKind::DeleteKey => "Delete",
             PivCredKind::MoveKey => "Move",
             PivCredKind::NewChuid => "Write",
+            PivCredKind::SelfTest => "Run",
             _ => self.title(),
         }
     }
@@ -1405,6 +1412,7 @@ impl PivCredKind {
             PivCredKind::DeleteKey => "Deleting key\u{2026}",
             PivCredKind::MoveKey => "Moving key\u{2026}",
             PivCredKind::NewChuid => "Writing a new CHUID\u{2026}",
+            PivCredKind::SelfTest => "Running self-test\u{2026}",
         }
     }
     /// True when this flow collects the *current* management key (and therefore
@@ -1434,6 +1442,10 @@ struct PivCredModal {
     kind: PivCredKind,
     busy: bool,
     result: Option<Result<(), String>>,
+    /// A multi-line report shown under the success line — currently only the
+    /// per-operation pass list from a `SelfTest` run that fully passed. A
+    /// failing run puts its report in `result`'s `Err` instead.
+    detail: Option<String>,
 }
 
 impl PivCredModal {
@@ -1442,6 +1454,7 @@ impl PivCredModal {
             kind,
             busy: false,
             result: None,
+            detail: None,
         }
     }
 }
@@ -7098,6 +7111,95 @@ impl App {
         )
     }
 
+    /// The selected slot's `(PIN policy, touch policy)` from the last
+    /// `status_detailed` read, or `None` when the card didn't report one.
+    fn piv_selected_slot_policy(
+        &self,
+    ) -> Option<(keyroost_piv::PinPolicy, keyroost_piv::TouchPolicy)> {
+        let sel = self.piv.selected_slot.to_slot();
+        self.piv
+            .slot_policies
+            .iter()
+            .find(|(s, _)| *s == sel)
+            .and_then(|(_, pol)| *pol)
+    }
+
+    /// The selected slot's key algorithm (from the last `status_detailed`
+    /// read) and whether it holds a certificate — the two facts the Test row
+    /// gates its button on.
+    fn piv_selected_test_target(&self) -> (Option<keyroost_piv::KeyAlg>, bool) {
+        let sel = self.piv.selected_slot.to_slot();
+        let entry = self.piv.slot_keys.iter().find(|(s, _, _)| *s == sel);
+        let alg = entry.and_then(|(_, a, _)| *a);
+        let has_cert = entry.is_some_and(|(_, _, dn)| dn.is_some())
+            || self
+                .piv
+                .status
+                .as_ref()
+                .is_some_and(|st| st.slots.iter().any(|s| s.slot == sel && s.cert_present));
+        (alg, has_cert)
+    }
+
+    /// Run every self-test the selected slot's key algorithm supports
+    /// (decrypt, then key-agree, then sign): build a fixed challenge from the
+    /// slot certificate's public key ([`keyroost_pivtest`]), run the
+    /// private-key op on the card, and verify the reply against that public
+    /// key. Read-only on the card — no write, no management key. The PIN is
+    /// verified unless the slot's PIN policy is `never` and the field is
+    /// blank. Each operation's pass/fail is reported together.
+    fn piv_self_test(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
+        let slot = self.piv.selected_slot.to_slot();
+        let policy = self.piv_selected_slot_policy();
+        let pin_required = policy.map(|(p, _)| p) != Some(keyroost_piv::PinPolicy::Never);
+        let want_touch = matches!(
+            policy.map(|(_, t)| t),
+            Some(keyroost_piv::TouchPolicy::Always | keyroost_piv::TouchPolicy::Cached)
+        );
+        self.piv.notice = None;
+        let label = if want_touch {
+            "Running self-test\u{2026} \u{2014} touch the key"
+        } else {
+            "Running self-test\u{2026}"
+        };
+        self.spawn_job(label, move || {
+            let outcome = run_piv_self_test(&name, slot, pin_required, pin.as_bytes());
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.piv.sign_pin);
+                let (all_ok, text) = match &outcome {
+                    // Skipped ops don't count as failures.
+                    Ok(results) => (
+                        !results.iter().any(|(_, r)| r.is_failure()),
+                        keyroost_pivtest::format_report(results),
+                    ),
+                    Err(e) => (false, e.clone()),
+                };
+                if all_ok {
+                    app.log(
+                        Severity::Ok,
+                        format!("PIV self-test on {} passed", slot.label()),
+                    );
+                    app.piv.error = None;
+                    app.piv.notice = Some(text.clone());
+                } else {
+                    app.log(
+                        Severity::Err,
+                        format!("PIV self-test on {} failed", slot.label()),
+                    );
+                    app.piv.notice = None;
+                    app.piv.error = Some(text.clone());
+                }
+                if let Some(m) = app.piv.cred_modal.as_mut() {
+                    m.detail = all_ok.then_some(text);
+                }
+                Self::apply_piv_cred_result(app);
+            })
+        });
+    }
+
     /// Normalize the certificate-subject field: a bare name becomes `CN=name`;
     /// anything containing `=` is taken as a full distinguished name.
     fn piv_subject(&self) -> Option<String> {
@@ -7625,7 +7727,8 @@ fn piv_cred_mismatch(piv: &PivState, kind: PivCredKind) -> Option<&'static str> 
         | PivCredKind::DeleteCert
         | PivCredKind::DeleteKey
         | PivCredKind::MoveKey
-        | PivCredKind::NewChuid => return None,
+        | PivCredKind::NewChuid
+        | PivCredKind::SelfTest => return None,
     };
     if confirm.is_empty() || new == confirm {
         None
@@ -7653,7 +7756,65 @@ fn piv_cred_success(kind: PivCredKind) -> &'static str {
         PivCredKind::DeleteKey => "Key deleted",
         PivCredKind::MoveKey => "Key moved",
         PivCredKind::NewChuid => "New CHUID written",
+        PivCredKind::SelfTest => "Self-test complete",
     }
+}
+
+/// Run every [`keyroost_pivtest::SelfTest`] against the card on `reader`
+/// (delegating the orchestration to [`keyroost_pivtest::run`]). Operations the
+/// slot's key algorithm doesn't do come back `keyroost_pivtest::Outcome::Skipped`
+/// (which carries the algorithm, so [`keyroost_pivtest::format_report`] can name
+/// it) and are shown in the dialog like the others.
+///
+/// `Err` is a *setup* failure (couldn't open the card, no certificate in the
+/// slot, unreadable key, PIN rejected) — nothing was tested.
+fn run_piv_self_test(
+    reader: &str,
+    slot: keyroost_piv::Slot,
+    pin_required: bool,
+    pin: &[u8],
+) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, String> {
+    let mut s = keyroost_transport::PivSession::open(reader).map_err(|e| e.to_string())?;
+    let cert = s
+        .read_certificate(slot)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{} has no certificate to test against", slot.label()))?;
+    let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
+        .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+
+    if !keyroost_pivtest::SelfTest::all()
+        .into_iter()
+        .any(|op| keyroost_pivtest::supports(op, alg))
+    {
+        return Err(format!("no self-test applies to a {} key", alg.label()));
+    }
+
+    // Verify once up front so a wrong PIN fails the whole run (one retry, not
+    // one per op). PIN-per-use slots (9C) drop the verified state after each
+    // GENERAL AUTHENTICATE, so the per-op closure re-verifies before every
+    // op after the first that actually runs.
+    if pin_required || !pin.is_empty() {
+        s.verify_pin(pin).map_err(|e| e.to_string())?;
+    }
+    let mut ran = 0usize;
+    Ok(keyroost_pivtest::run(
+        alg,
+        &pubkey,
+        |op, input| -> Result<Vec<u8>, String> {
+            if pin_required && ran > 0 {
+                s.verify_pin(pin).map_err(|e| e.to_string())?;
+            }
+            ran += 1;
+            if op.is_key_agreement() {
+                s.key_agree(slot, alg, input)
+            } else if op == keyroost_pivtest::SelfTest::Decrypt {
+                s.decrypt(slot, alg, input)
+            } else {
+                s.sign(slot, alg, input)
+            }
+            .map_err(|e| e.to_string())
+        },
+    ))
 }
 
 /// Slots a key may be moved to: every standard + retired slot that is empty
@@ -12455,6 +12616,18 @@ impl App {
         };
         let busy = self.piv.cred_modal.as_ref().is_some_and(|m| m.busy);
         let result = self.piv.cred_modal.as_ref().and_then(|m| m.result.clone());
+        let detail = self.piv.cred_modal.as_ref().and_then(|m| m.detail.clone());
+        // The self-test spinner asks for a touch when the selected slot's
+        // touch policy needs one (mirrors the Generate-key spinner wording).
+        let busy_text = if kind == PivCredKind::SelfTest
+            && matches!(
+                self.piv_selected_slot_policy().map(|(_, t)| t),
+                Some(keyroost_piv::TouchPolicy::Always | keyroost_piv::TouchPolicy::Cached)
+            ) {
+            format!("{} \u{2014} touch the key", kind.busy_label())
+        } else {
+            kind.busy_label().to_owned()
+        };
 
         let mut want_submit = false;
         let mut want_close = false;
@@ -12516,6 +12689,13 @@ impl App {
                             .font(theme::f_sb(13.0))
                             .color(p.ok),
                     );
+                    // Per-operation breakdown (self-test): one line each.
+                    if let Some(d) = &detail {
+                        ui.add_space(6.0);
+                        for line in d.lines() {
+                            card_note(ui, p, line);
+                        }
+                    }
                     ui.add_space(16.0);
                     if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
                         want_close = true;
@@ -12626,6 +12806,26 @@ impl App {
                         PivCredKind::RequestCsr => {
                             pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
                             card_note(ui, p, "The PIN authorizes the on-card signature.");
+                        }
+                        PivCredKind::SelfTest => {
+                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                            if self.piv_selected_slot_policy().map(|(pin, _)| pin)
+                                == Some(keyroost_piv::PinPolicy::Never)
+                            {
+                                card_note(
+                                    ui,
+                                    p,
+                                    "This slot's PIN policy is \u{201c}never\u{201d} \u{2014} \
+                                     you can leave the PIN blank.",
+                                );
+                            }
+                            card_note(
+                                ui,
+                                p,
+                                "Runs every self-test the slot's key supports (decrypt / \
+                                 key-agree / sign) and verifies each result against the \
+                                 certificate's public key. Nothing on the card changes.",
+                            );
                         }
                         PivCredKind::SetRetries => {
                             self.piv_modal_mgmt_field(ui, p, kind);
@@ -12798,7 +12998,7 @@ impl App {
                         if busy {
                             ui.add(egui::Spinner::new());
                             ui.label(
-                                egui::RichText::new(kind.busy_label())
+                                egui::RichText::new(busy_text.as_str())
                                     .font(theme::f_reg(12.5))
                                     .color(p.txt2),
                             );
@@ -12858,6 +13058,7 @@ impl App {
                 PivCredKind::DeleteKey => self.piv_delete_key(),
                 PivCredKind::MoveKey => self.piv_move_key(),
                 PivCredKind::NewChuid => self.piv_new_chuid(),
+                PivCredKind::SelfTest => self.piv_self_test(),
             }
             // If the op didn't actually queue, unstick the modal. This happens
             // either because the worker was busy (no error set — just retry on
@@ -13737,6 +13938,7 @@ impl App {
         let mut open_delete_cert = false;
         let mut open_delete_key = false;
         let mut open_move_key = false;
+        let mut open_self_test = false;
         let mut open_new_chuid = false;
         let mut click_retired_tab = false;
         let mut arm_reset = false;
@@ -14435,6 +14637,42 @@ impl App {
                     }
                 });
             });
+
+            // --- Test: one button that runs every self-test the selected
+            // slot's key supports (decrypt / key-agree / sign, in that order)
+            // and reports each result. Read-only — the card operates but
+            // nothing is written. Live only when the slot holds a certificate
+            // with a key type keyroost can test.
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Test")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "piv-test");
+                let (test_alg, test_has_cert) = self.piv_selected_test_target();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if test_has_cert && test_alg.is_some() {
+                        if theme::button(ui, p, BtnKind::Default, "Test\u{2026}").clicked() {
+                            open_self_test = true;
+                        }
+                    } else {
+                        let why = if !test_has_cert {
+                            "Needs a certificate in this slot."
+                        } else {
+                            "The slot's key type is unknown."
+                        };
+                        ui.add_enabled_ui(false, |ui| {
+                            theme::button(ui, p, BtnKind::Default, "Test\u{2026}")
+                        })
+                        .inner
+                        .on_disabled_hover_text(why);
+                    }
+                });
+            });
+
             if !can_delete_key {
                 ui.add_space(4.0);
                 note(ui, "Key deletion needs YubiKey 5.7+.");
@@ -14534,6 +14772,10 @@ impl App {
         if open_delete_key {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::DeleteKey));
+        }
+        if open_self_test {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::SelfTest));
         }
         if open_move_key {
             self.piv_cred_modal_close();
@@ -17192,6 +17434,7 @@ mod tests {
             kind: PivCredKind::ChangePin,
             busy: true,
             result: None,
+            detail: None,
         });
         app.piv.error = None;
         App::apply_piv_cred_result(&mut app);

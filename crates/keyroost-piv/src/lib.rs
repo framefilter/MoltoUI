@@ -875,17 +875,30 @@ pub fn general_auth_mutual(
     )
 }
 
-/// The GENERAL AUTHENTICATE dynamic-authentication template body shared by
-/// [`general_auth_sign`] (single extended-length APDU) and
-/// [`general_auth_sign_chained`] (ISO 7816-4 command chaining): `7C L 82 00
-/// 81 <l> <payload>`.
-fn general_auth_sign_data(payload: &[u8]) -> Vec<u8> {
+/// The GENERAL AUTHENTICATE dynamic-authentication template body: `7C L 82 00
+/// <inner_tag> <l> <payload>` — an empty `0x82` ("give me the answer") plus
+/// the input in `inner_tag`. Signing / decryption put the data in `0x81`
+/// (see [`general_auth_sign_data`]); key agreement puts the peer public key
+/// in `0x85` (see [`general_auth_key_agree_data`]).
+fn general_auth_dyn_auth_data(inner_tag: u8, payload: &[u8]) -> Vec<u8> {
     let mut inner = Vec::with_capacity(payload.len() + 6);
     inner.extend_from_slice(&[0x82, 0x00]); // response tag, empty: "give me the answer"
-    push_tlv(&mut inner, &[0x81], payload); // challenge / data to sign
+    push_tlv(&mut inner, &[inner_tag], payload);
     let mut data = Vec::with_capacity(inner.len() + 4);
     push_tlv(&mut data, &[TAG_DYN_AUTH], &inner);
     data
+}
+
+/// The template body shared by [`general_auth_sign`] and
+/// [`general_auth_sign_chained`]: `7C L 82 00 81 <l> <payload>`.
+fn general_auth_sign_data(payload: &[u8]) -> Vec<u8> {
+    general_auth_dyn_auth_data(0x81, payload)
+}
+
+/// The template body shared by [`general_auth_key_agree`] and
+/// [`general_auth_key_agree_chained`]: `7C L 82 00 85 <l> <peer_public_key>`.
+fn general_auth_key_agree_data(peer_public_key: &[u8]) -> Vec<u8> {
+    general_auth_dyn_auth_data(0x85, peer_public_key)
 }
 
 /// GENERAL AUTHENTICATE in signing mode: ask a key slot to sign/decrypt
@@ -930,6 +943,47 @@ pub fn general_auth_sign_chained(
         key_alg.id(),
         key_ref,
         &general_auth_sign_data(payload),
+        max_chunk,
+        Some(0x00),
+    )
+}
+
+/// GENERAL AUTHENTICATE in key-establishment mode: ask an EC key slot to run
+/// ECDH against `peer_public_key` (SP 800-73-4 Part 2 §3.2.4 — the peer key
+/// goes in the dynamic-auth template's `0x85` "exponentiation" field). The
+/// card replies with `7C L 82 <l> <Z>`, where `Z` is the raw shared secret
+/// (the x-coordinate for the NIST curves, the 32-byte output for X25519).
+/// `peer_public_key` is `04 || X || Y` for P-256/P-384 or the raw 32-byte
+/// point for X25519; `key_alg` (P1) is the slot's algorithm, `key_ref` (P2)
+/// its slot.
+#[must_use]
+pub fn general_auth_key_agree(key_alg: KeyAlg, key_ref: u8, peer_public_key: &[u8]) -> Vec<u8> {
+    build_apdu_ext(
+        0x00,
+        Instruction::GeneralAuthenticate.code(),
+        key_alg.id(),
+        key_ref,
+        &general_auth_key_agree_data(peer_public_key),
+        Some(0),
+    )
+}
+
+/// Command-chaining form of [`general_auth_key_agree`], the same fallback
+/// [`general_auth_sign_chained`] is to [`general_auth_sign`] — for cards /
+/// readers that reject a single extended-`Lc` GENERAL AUTHENTICATE.
+#[must_use]
+pub fn general_auth_key_agree_chained(
+    key_alg: KeyAlg,
+    key_ref: u8,
+    peer_public_key: &[u8],
+    max_chunk: usize,
+) -> Vec<Vec<u8>> {
+    chain_apdu(
+        0x00,
+        Instruction::GeneralAuthenticate.code(),
+        key_alg.id(),
+        key_ref,
+        &general_auth_key_agree_data(peer_public_key),
         max_chunk,
         Some(0x00),
     )
@@ -2406,6 +2460,40 @@ mod tests {
         assert_eq!(&apdu[7..11], &[0x7C, 0x82, 0x01, 0x06]);
         assert_eq!(&apdu[apdu.len() - 2..], &[0x00, 0x00]);
         assert_eq!(apdu.len(), 7 + lc + 2);
+    }
+
+    #[test]
+    fn general_auth_key_agree_uses_tag_85() {
+        // Same shape as general_auth_sign but the peer key sits in 0x85, not 0x81:
+        // 00 87 11 9D 0A  7C 08 82 00 85 04 <peer>  00
+        let apdu = general_auth_key_agree(KeyAlg::EccP256, 0x9D, &[0x04, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(
+            apdu,
+            vec![
+                0x00, 0x87, 0x11, 0x9D, 0x0A, 0x7C, 0x08, 0x82, 0x00, 0x85, 0x04, 0x04, 0xAA, 0xBB,
+                0xCC, 0x00,
+            ]
+        );
+        // A large payload forces the extended form; the 0x85 inner tag stays.
+        let apdu = general_auth_key_agree(KeyAlg::EccP256, 0x9D, &[0x04; 256]);
+        assert_eq!(&apdu[..5], &[0x00, 0x87, 0x11, 0x9D, 0x00]);
+        assert_eq!(&apdu[7..11], &[0x7C, 0x82, 0x01, 0x06]); // 7C len == sign's, 0x85 body
+        assert_eq!(apdu[13], 0x85);
+        assert_eq!(&apdu[apdu.len() - 2..], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn general_auth_key_agree_chained_matches_sign_chained_shape() {
+        let chunks =
+            general_auth_key_agree_chained(KeyAlg::EccP256, 0x9D, &[0x04, 0xAA, 0xBB, 0xCC], 254);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0],
+            vec![
+                0x00, 0x87, 0x11, 0x9D, 0x0A, 0x7C, 0x08, 0x82, 0x00, 0x85, 0x04, 0x04, 0xAA, 0xBB,
+                0xCC, 0x00,
+            ]
+        );
     }
 
     #[test]

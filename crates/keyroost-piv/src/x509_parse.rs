@@ -442,10 +442,13 @@ const OID_X25519: &str = "1.3.101.110";
 /// RSA modulus whose bit length doesn't land on one of PIV's four sizes): an
 /// unusual certificate shouldn't stop the caller from displaying whatever
 /// else (e.g. the Subject DN) it already parsed.
-pub fn parse_key_algorithm(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseError> {
-    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+/// The whole DER encoding of a `Certificate`'s `subjectPublicKeyInfo`
+/// `SEQUENCE` (tag, length, and content), by walking `Certificate ::= SEQUENCE
+/// { tbsCertificate, signatureAlgorithm, signature }` into `tbsCertificate`
+/// and skipping the fields ahead of the SPKI. Shared by [`parse_key_algorithm`]
+/// and [`parse_certificate_public_key`].
+fn certificate_spki(cert_der: &[u8]) -> Result<&[u8], X509ParseError> {
     let (cert, _) = expect_tag(cert_der, 0x30)?;
-    // tbsCertificate ::= SEQUENCE { ... }
     let (tbs, _) = expect_tag(cert.content, 0x30)?;
     let mut rest = tbs.content;
 
@@ -463,8 +466,15 @@ pub fn parse_key_algorithm(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseE
     let (_, rest) = expect_tag(rest, 0x30)?;
     let (_, rest) = expect_tag(rest, 0x30)?;
     let (_, rest) = expect_tag(rest, 0x30)?;
+    // `rest` now starts at subjectPublicKeyInfo; take its whole TLV.
+    let (_, after_spki) = expect_tag(rest, 0x30)?;
+    Ok(&rest[..rest.len() - after_spki.len()])
+}
+
+pub fn parse_key_algorithm(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseError> {
+    let spki = certificate_spki(cert_der)?;
     // subjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
-    let (spki, _) = expect_tag(rest, 0x30)?;
+    let (spki, _) = expect_tag(spki, 0x30)?;
     let (alg_id, after_alg_id) = expect_tag(spki.content, 0x30)?;
     let (spk, _) = expect_tag(after_alg_id, 0x03)?;
 
@@ -602,6 +612,21 @@ pub fn parse_subject_public_key_info(der: &[u8]) -> Result<(KeyAlg, PublicKey), 
         )),
         _ => Err(X509ParseError::Malformed),
     }
+}
+
+/// The algorithm and public key of a DER-encoded X.509 `Certificate`, from its
+/// `subjectPublicKeyInfo` — [`parse_key_algorithm`] plus the key material
+/// [`parse_subject_public_key_info`] recovers. Unlike `parse_key_algorithm`
+/// this errors (rather than `Ok(None)`) on an unrecognised key type: a caller
+/// that needs the key bytes has nothing to do with a key it can't read.
+///
+/// # Errors
+/// [`X509ParseError`] on a malformed certificate or a public-key OID/curve
+/// outside PIV's [`KeyAlg`] set.
+pub fn parse_certificate_public_key(
+    cert_der: &[u8],
+) -> Result<(KeyAlg, PublicKey), X509ParseError> {
+    parse_subject_public_key_info(certificate_spki(cert_der)?)
 }
 
 #[cfg(test)]
