@@ -14023,6 +14023,24 @@ impl App {
             &self.piv.slot_keys,
             self.piv.retired_occupancy.as_deref(),
         );
+        // Whether the active slot holds an X.509 certificate — gates Export.
+        // Standard slots read `status.slots`; retired slots carry no cert
+        // signal in the loaded state, and neither does the pane before its
+        // first status read, so both resolve optimistically (the button stays
+        // live and the low-level "slot holds no certificate" error still
+        // guards). Only a standard slot the card has read and found certless
+        // dims the button.
+        let selected_has_cert = match selected {
+            PivSlotSel::Retired(_) => true,
+            _ => {
+                !self.piv.loaded
+                    || self.piv.status.as_ref().is_some_and(|s| {
+                        s.slots
+                            .iter()
+                            .any(|sl| sl.slot == selected.to_slot() && sl.cert_present)
+                    })
+            }
+        };
         // Move key / Delete key are Yubico extensions (MOVE/DELETE KEY), not
         // SP 800-73-4. `keyroost_piv::compat` resolves a per-fingerprint
         // white/blacklist against the applet's reported version into a
@@ -14041,14 +14059,12 @@ impl App {
         // fingerprint white/blacklist can't clear them — built from the shared
         // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
         // same thing: the extension's `requirement()` sentence, then a state
-        // suffix. Each string is shown in two lockstep places: the hover on
-        // the marker by the row's help dot (a \u{26a0} for Unverified, the
-        // dimmed button for Unsupported) and the always-visible summary line
-        // at the foot of the card. "Key deletion" / "Moving keys" keep each
-        // distinct from the Delete row's other button, "Delete
-        // certificate\u{2026}" — and the Delete-key \u{26a0} hover additionally
-        // appends that "Delete certificate" is standard PIV and unaffected,
-        // which the terser foot-of-card line omits (see the hover call site).
+        // suffix. Each string is a hover: on the \u{26a0} marker by the row's
+        // help dot for Unverified, on the dimmed button for Unsupported.
+        // "Key deletion" / "Moving keys" keep each distinct from the Delete
+        // row's other button, "Delete certificate\u{2026}" — and the Delete-key
+        // \u{26a0} hover additionally appends that "Delete certificate" is
+        // standard PIV and unaffected (see the hover call site).
         let move_key_unverified_hint = format!(
             "{} {}",
             PivExtension::MoveKey.requirement(),
@@ -14069,6 +14085,19 @@ impl App {
             PivExtension::DeleteKey.requirement(),
             FeatureGate::INCOMPATIBLE_SUFFIX
         );
+        // Both certificate actions below (self-sign into the slot, and sign a
+        // CSR) are signed *by this slot's key*. With no key there is nothing to
+        // sign with and the on-card step fails deep in the flow ("slot has no
+        // key…"), so the buttons are dimmed until a key is present and say why
+        // on hover — same treatment as the Move/Delete-key rows.
+        let no_slot_key_hint = "This slot has no key. Generate a key in this slot first \u{2014} \
+             a self-signed certificate and a CSR are both signed by it.";
+        let no_slot_cert_hint =
+            "This slot holds no certificate to export. Import one, or create a self-signed \
+             certificate above.";
+        let no_move_key_hint =
+            "This slot has no key to move \u{2014} generate one in this slot first.";
+        let no_del_cert_hint = "This slot holds no certificate to delete.";
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab, exactly like the FIDO2 sub-tab strip
         // (Passkeys / Settings / Storage): an opaque surface strip behind a row
@@ -14319,9 +14348,15 @@ impl App {
                         .suffix(" days"),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot").clicked()
-                    {
-                        open_self_sign = true;
+                    if selected_has_key {
+                        if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
+                            .clicked()
+                        {
+                            open_self_sign = true;
+                        }
+                    } else {
+                        theme::button_disabled(ui, p, "Self-signed \u{2192} slot")
+                            .on_hover_text(no_slot_key_hint);
                     }
                 });
             });
@@ -14337,8 +14372,13 @@ impl App {
                     240.0,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
-                        open_csr = true;
+                    if selected_has_key {
+                        if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
+                            open_csr = true;
+                        }
+                    } else {
+                        theme::button_disabled(ui, p, "Sign & save CSR")
+                            .on_hover_text(no_slot_key_hint);
                     }
                     ui.add_space(8.0);
                     save_csr = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
@@ -14419,8 +14459,13 @@ impl App {
                     240.0,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
-                        go_export = true;
+                    if selected_has_cert {
+                        if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
+                            go_export = true;
+                        }
+                    } else {
+                        theme::button_disabled(ui, p, "Export certificate")
+                            .on_hover_text(no_slot_cert_hint);
                     }
                     ui.add_space(8.0);
                     save_export = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
@@ -14444,46 +14489,52 @@ impl App {
             // inside the Delete row, which put a deliberately non-destructive
             // action under a destructive heading and left it sharing the delete
             // help text — the one place a user checking "is this safe?" would
-            // look. Needs a key in the active slot to make sense at all; the
-            // 5.7+ firmware gate only dims the button (with a hover reason)
-            // rather than hiding the row, so the capability stays discoverable.
-            if selected_has_key {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Move key")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-move");
-                    // Support-unverified warning sits right after the help dot,
-                    // by the operation's own explanation — not out by the
-                    // button.
-                    if matches!(move_key_gate, FeatureGate::Unverified) {
-                        ui.add_space(4.0);
-                        theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        match move_key_gate {
-                            // Unverified still runs — the card refuses if it
-                            // truly can't — so the button stays live; only the
-                            // warning above marks the doubt.
-                            FeatureGate::Supported | FeatureGate::Unverified => {
-                                if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}")
-                                    .clicked()
-                                {
-                                    open_move_key = true;
-                                }
-                            }
-                            FeatureGate::Unsupported => {
+            // look. The row is always shown so the capability stays
+            // discoverable; the button is dimmed with a hover reason when the
+            // slot has no key to move, or on pre-5.7 firmware.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Move key")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "piv-move");
+                // Support-unverified warning sits right after the help dot, by
+                // the operation's own explanation — not out by the button. It
+                // reflects the device's MOVE KEY support, so it shows whether or
+                // not this slot currently has a key for the button to act on
+                // (the button may be dimmed for "no key" underneath it).
+                if matches!(move_key_gate, FeatureGate::Unverified) {
+                    ui.add_space(4.0);
+                    theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match move_key_gate {
+                        // Blacklisted on this device wins over "no key": the
+                        // firmware reason is the one the user has to resolve
+                        // first, and it holds whether or not the slot is empty.
+                        FeatureGate::Unsupported => {
+                            theme::button_disabled(ui, p, "Move key\u{2026}")
+                                .on_hover_text(move_key_blocked_hint.as_str());
+                        }
+                        // Unverified still runs — the card refuses if it truly
+                        // can't — so the button stays live where there is a key;
+                        // only the warning above marks the doubt.
+                        FeatureGate::Supported | FeatureGate::Unverified => {
+                            if !selected_has_key {
                                 theme::button_disabled(ui, p, "Move key\u{2026}")
-                                    .on_hover_text(move_key_blocked_hint.as_str());
+                                    .on_hover_text(no_move_key_hint);
+                            } else if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}")
+                                .clicked()
+                            {
+                                open_move_key = true;
                             }
                         }
-                    });
+                    }
                 });
-                ui.add_space(12.0);
-            }
+            });
+            ui.add_space(12.0);
             // --- Delete: bold label + help left, the two delete
             // actions right-aligned (Delete key is Danger, gated 5.7+).
             ui.horizontal(|ui| {
@@ -14496,9 +14547,9 @@ impl App {
                 self.help_dot(ui, p, "piv-delete");
                 // Support-unverified warning for "Delete key" sits here, beside
                 // the row's help dot — not out by the button — so its hover
-                // text names "Delete key" explicitly and, unlike the terser
-                // foot-of-card line, spells out that "Delete certificate" (the
-                // other button on this row) is standard PIV and unaffected.
+                // text names "Delete key" explicitly and spells out that
+                // "Delete certificate" (the other button on this row) is
+                // standard PIV and unaffected.
                 if matches!(delete_key_gate, FeatureGate::Unverified) {
                     ui.add_space(4.0);
                     theme::warn_marker(ui, p).on_hover_text(format!(
@@ -14519,52 +14570,31 @@ impl App {
                         }
                         FeatureGate::Unsupported => {
                             // Kept visible but dimmed on pre-5.7 firmware so the
-                            // action is discoverable; the hover text and the
-                            // foot-of-card line both say why it can't run yet.
+                            // action is discoverable; the hover text says why it
+                            // can't run yet.
                             theme::button_disabled(ui, p, "Delete key\u{2026}")
                                 .on_hover_text(delete_key_blocked_hint.as_str());
                         }
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
-                        .clicked()
-                    {
-                        open_delete_cert = true;
+                    // "Delete certificate" is standard PIV, so no firmware gate
+                    // — but like Export it needs a certificate to act on. Same
+                    // cert-presence signal, same optimistic fallback for retired
+                    // slots / pre-first-read. "Delete key" is deliberately not
+                    // gated: without GET METADATA key presence is unknown, and a
+                    // stale key is still worth an attempt to erase.
+                    if selected_has_cert {
+                        if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
+                            .clicked()
+                        {
+                            open_delete_cert = true;
+                        }
+                    } else {
+                        theme::button_disabled(ui, p, "Delete certificate\u{2026}")
+                            .on_hover_text(no_del_cert_hint);
                     }
                 });
             });
-            // Foot-of-card summary of every non-standard slot operation the
-            // fingerprint white/blacklist couldn't clear — one line each,
-            // matching the hover text on that row's warning marker (Unverified)
-            // or dimmed button (Unsupported), minus the Delete-key hover's
-            // trailing "Delete certificate is unaffected" aside. "Move key"
-            // only has a row when the slot holds a key, so its line is gated
-            // the same way.
-            for (shown, gate, unverified_line, blocked_line) in [
-                (
-                    selected_has_key,
-                    move_key_gate,
-                    move_key_unverified_hint.as_str(),
-                    move_key_blocked_hint.as_str(),
-                ),
-                (
-                    true,
-                    delete_key_gate,
-                    delete_key_unverified_hint.as_str(),
-                    delete_key_blocked_hint.as_str(),
-                ),
-            ] {
-                if !shown {
-                    continue;
-                }
-                let line = match gate {
-                    FeatureGate::Supported => continue,
-                    FeatureGate::Unverified => unverified_line,
-                    FeatureGate::Unsupported => blocked_line,
-                };
-                ui.add_space(4.0);
-                note(ui, line);
-            }
         });
         ui.add_space(12.0);
 
