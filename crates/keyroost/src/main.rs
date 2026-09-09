@@ -2242,9 +2242,25 @@ impl App {
                         let text = path.display().to_string();
                         match target {
                             FileTarget::OpenpgpImport => self.openpgp.import_path = text,
-                            FileTarget::PivCsr => self.piv.csr_path = text,
-                            FileTarget::PivCert => self.piv.cert_path = text,
-                            FileTarget::PivExport => self.piv.export_path = text,
+                            // PIV cert file ops pick the path first, then act:
+                            // CSR and import need a secret, so open their modal;
+                            // export writes straight to the chosen path.
+                            FileTarget::PivCsr => {
+                                self.piv.csr_path = text;
+                                self.piv_cred_modal_close();
+                                self.piv.cred_modal =
+                                    Some(PivCredModal::new(PivCredKind::RequestCsr));
+                            }
+                            FileTarget::PivCert => {
+                                self.piv.cert_path = text;
+                                self.piv_cred_modal_close();
+                                self.piv.cred_modal =
+                                    Some(PivCredModal::new(PivCredKind::ImportCert));
+                            }
+                            FileTarget::PivExport => {
+                                self.piv.export_path = text;
+                                self.piv_export_cert();
+                            }
                             FileTarget::LbExport(idx) => {
                                 use keyroost_ctap::large_blobs::EntryKind;
                                 // The array may have been reloaded, cleared, or
@@ -7180,17 +7196,10 @@ impl App {
             self.piv.error = Some("enter a name for the certificate request".into());
             return;
         };
+        // The path comes from a native save dialog, which already handled its
+        // own "replace existing file?" prompt — so no empty / clobber checks
+        // here.
         let path = self.piv.csr_path.trim().to_owned();
-        if path.is_empty() {
-            self.piv.error = Some("enter a destination path for the request".into());
-            return;
-        }
-        if std::path::Path::new(&path).exists() {
-            self.piv.error = Some(format!(
-                "{path} already exists — delete it first or choose another name"
-            ));
-            return;
-        }
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
         // See `load_piv_status`: this job opens its own fresh `PivSession`, so
@@ -7239,19 +7248,10 @@ impl App {
             return;
         };
         let slot = self.piv.selected_slot.to_slot();
+        // The path comes from a native save dialog, which already handled its
+        // own "replace existing file?" prompt — so no empty / clobber checks
+        // here.
         let path = self.piv.export_path.trim().to_owned();
-        if path.is_empty() {
-            self.piv.error = Some("enter a destination path for the certificate".into());
-            return;
-        }
-        // Refuse to clobber an existing file — the user can delete it or pick
-        // another name; there is no undo for an overwritten file.
-        if std::path::Path::new(&path).exists() {
-            self.piv.error = Some(format!(
-                "{path} already exists — delete it first or choose another name"
-            ));
-            return;
-        }
         self.piv.notice = None;
         self.spawn_job("Exporting certificate\u{2026}", move || {
             let result = (|| -> Result<usize, TransportError> {
@@ -12600,6 +12600,7 @@ impl App {
                             );
                         }
                         PivCredKind::ImportCert => {
+                            card_note(ui, p, &format!("Reading {}", self.piv.cert_path));
                             self.piv_modal_mgmt_field(ui, p, kind);
                             // Importing only replaces the public certificate
                             // object (no key loss) — a lighter note, not a red
@@ -12625,6 +12626,7 @@ impl App {
                             );
                         }
                         PivCredKind::RequestCsr => {
+                            card_note(ui, p, &format!("Saving to {}", self.piv.csr_path));
                             pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
                             card_note(ui, p, "The PIN authorizes the on-card signature.");
                         }
@@ -14316,8 +14318,12 @@ impl App {
             }
 
             ui.add_space(12.0);
-            // --- Certificate: subject/validity inputs, then the two
-            // issue actions each right-aligned on their own row.
+            // --- Certificate: subject/validity inputs, then both issue actions
+            // on one right-aligned row — "Sign & save CSR" then "Self-signed ->
+            // slot". Each is signed by the slot's key, so both dim with the same
+            // reason when the slot has none. "Sign & save CSR" opens a save
+            // dialog first (see `drain_file_dialogs`); "Self-signed -> slot"
+            // opens the PIN / management-key modal.
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Certificate")
@@ -14347,6 +14353,8 @@ impl App {
                         .range(1..=keyroost_piv::max_valid_days(u64::from(unix_now())))
                         .suffix(" days"),
                 );
+                // right_to_left: add "Self-signed" first so it sits at the far
+                // right, then "Sign & save CSR" to its left.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if selected_has_key {
                         if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
@@ -14358,43 +14366,24 @@ impl App {
                         theme::button_disabled(ui, p, "Self-signed \u{2192} slot")
                             .on_hover_text(no_slot_key_hint);
                     }
-                });
-            });
-            ui.add_space(6.0);
-            let mut save_csr = false;
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "CSR file",
-                    &mut self.piv.csr_path,
-                    "/path/to/request.csr",
-                    240.0,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
                     if selected_has_key {
-                        if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, "Sign & save CSR\u{2026}")
+                            .clicked()
+                        {
                             open_csr = true;
                         }
                     } else {
-                        theme::button_disabled(ui, p, "Sign & save CSR")
+                        theme::button_disabled(ui, p, "Sign & save CSR\u{2026}")
                             .on_hover_text(no_slot_key_hint);
                     }
-                    ui.add_space(8.0);
-                    save_csr = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
                 });
             });
-            if save_csr {
-                self.spawn_file_dialog(
-                    FileTarget::PivCsr,
-                    true,
-                    &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
-                    Some("request.csr"),
-                );
-            }
 
             ui.add_space(12.0);
-            // --- Import cert: file path + Browse/Import right-aligned.
+            // --- Import cert: one button. It opens a file picker; picking a
+            // file then opens the management-key modal and the import runs on
+            // submit (see `drain_file_dialogs`).
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Import cert")
@@ -14403,41 +14392,19 @@ impl App {
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-import");
-            });
-            ui.add_space(6.0);
-            let mut browse_cert = false;
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "File",
-                    &mut self.piv.cert_path,
-                    "/path/to/cert.pem",
-                    240.0,
-                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
+                        .clicked()
+                    {
                         open_import = true;
                     }
-                    ui.add_space(8.0);
-                    browse_cert =
-                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
                 });
             });
-            if browse_cert {
-                self.spawn_file_dialog(
-                    FileTarget::PivCert,
-                    false,
-                    &[
-                        ("Certificates", &["pem", "der", "crt", "cer"]),
-                        ("All files", &["*"]),
-                    ],
-                    None,
-                );
-            }
 
             ui.add_space(12.0);
-            // --- Export cert: destination path + Save/Export right.
+            // --- Export cert: one button. It opens a save dialog and the
+            // certificate is written straight to the chosen path — no secret
+            // needed (see `drain_file_dialogs`).
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Export cert")
@@ -14446,43 +14413,19 @@ impl App {
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-export");
-            });
-            ui.add_space(6.0);
-            let mut save_export = false;
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "Destination",
-                    &mut self.piv.export_path,
-                    "/path/to/out.der",
-                    240.0,
-                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if selected_has_cert {
-                        if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, "Export certificate\u{2026}")
+                            .clicked()
+                        {
                             go_export = true;
                         }
                     } else {
-                        theme::button_disabled(ui, p, "Export certificate")
+                        theme::button_disabled(ui, p, "Export certificate\u{2026}")
                             .on_hover_text(no_slot_cert_hint);
                     }
-                    ui.add_space(8.0);
-                    save_export = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
                 });
             });
-            if save_export {
-                self.spawn_file_dialog(
-                    FileTarget::PivExport,
-                    true,
-                    &[
-                        ("Certificate (DER)", &["der", "cer"]),
-                        ("Certificate (PEM)", &["pem", "crt"]),
-                        ("All files", &["*"]),
-                    ],
-                    Some("cert.der"),
-                );
-            }
 
             ui.add_space(12.0);
             // --- Move key: its own row, above Delete. It used to be a button
@@ -14654,26 +14597,48 @@ impl App {
         // The management-key-gated operations open the centered credential modal
         // (which collects their secrets and runs the op on Submit) rather than
         // running directly. Opening wipes any stale secret fields first so a
-        // fresh dialog starts blank. Export needs no secret, so it still runs
-        // inline.
+        // fresh dialog starts blank.
         if open_generate {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::GenerateKey));
         }
+        // Import / Export / CSR ask for the file first; the picked path is
+        // routed by `drain_file_dialogs`, which then opens the secret modal
+        // (import, CSR) or runs the write straight away (export).
         if open_import {
-            self.piv_cred_modal_close();
-            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportCert));
+            self.spawn_file_dialog(
+                FileTarget::PivCert,
+                false,
+                &[
+                    ("Certificates", &["pem", "der", "crt", "cer"]),
+                    ("All files", &["*"]),
+                ],
+                None,
+            );
         }
         if go_export {
-            self.piv_export_cert();
+            self.spawn_file_dialog(
+                FileTarget::PivExport,
+                true,
+                &[
+                    ("Certificate (DER)", &["der", "cer"]),
+                    ("Certificate (PEM)", &["pem", "crt"]),
+                    ("All files", &["*"]),
+                ],
+                Some("cert.der"),
+            );
         }
         if open_self_sign {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::SelfSign));
         }
         if open_csr {
-            self.piv_cred_modal_close();
-            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::RequestCsr));
+            self.spawn_file_dialog(
+                FileTarget::PivCsr,
+                true,
+                &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
+                Some("request.csr"),
+            );
         }
         if open_set_retries {
             self.piv_cred_modal_close();
