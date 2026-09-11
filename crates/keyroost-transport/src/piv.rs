@@ -1122,36 +1122,89 @@ impl PivSession {
         prepared: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
         let key_ref = slot.key_ref();
-        let apdu = piv::general_auth_sign(alg, key_ref, prepared);
+        self.general_auth_dyn_auth(
+            "piv sign",
+            &piv::general_auth_sign(alg, key_ref, prepared),
+            &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
+        )
+    }
+
+    /// Ask `slot`'s RSA private key to raw-decrypt `ciphertext` (a `k`-byte
+    /// PKCS#1 block) via GENERAL AUTHENTICATE. Wire-identical to [`Self::sign`]
+    /// — the card does the same raw RSA private-key operation for both, and
+    /// the input rides the same dynamic-auth `0x81` field — but named
+    /// separately so a decrypt call site reads as one. Needs a verified PIN
+    /// immediately prior, same as `sign`.
+    pub fn decrypt(
+        &mut self,
+        slot: Slot,
+        alg: KeyAlg,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        let key_ref = slot.key_ref();
+        self.general_auth_dyn_auth(
+            "piv decrypt",
+            &piv::general_auth_sign(alg, key_ref, ciphertext),
+            &piv::general_auth_sign_chained(alg, key_ref, ciphertext, CHAIN_CHUNK),
+        )
+    }
+
+    /// Run ECDH on `slot`'s private key against `peer_public_key` via GENERAL
+    /// AUTHENTICATE key-establishment (dynamic-auth tag `0x85`).
+    /// `peer_public_key` is `04 || X || Y` for P-256/P-384 or the raw 32-byte
+    /// point for X25519; the reply is the raw shared secret `Z` (the
+    /// x-coordinate for the NIST curves). Needs a verified PIN immediately
+    /// prior, same as [`Self::sign`].
+    pub fn key_agree(
+        &mut self,
+        slot: Slot,
+        alg: KeyAlg,
+        peer_public_key: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        let key_ref = slot.key_ref();
+        self.general_auth_dyn_auth(
+            "piv key-agree",
+            &piv::general_auth_key_agree(alg, key_ref, peer_public_key),
+            &piv::general_auth_key_agree_chained(alg, key_ref, peer_public_key, CHAIN_CHUNK),
+        )
+    }
+
+    /// The GENERAL AUTHENTICATE transmit shared by [`Self::sign`],
+    /// [`Self::decrypt`], and [`Self::key_agree`]: send `single` once, and if
+    /// it used extended-length encoding and the card rejected it (`SW != 9000`),
+    /// retry with the `chained` APDU sequence. Returns the response's `0x82`
+    /// dynamic-auth value. The fallback only fires when the first attempt
+    /// actually used extended-length encoding, so a genuine error on a
+    /// short-form command (bad PIN state, wrong key, …) isn't retried.
+    fn general_auth_dyn_auth(
+        &mut self,
+        label: &'static str,
+        single: &[u8],
+        chained: &[Vec<u8>],
+    ) -> Result<Vec<u8>, TransportError> {
         let (data, sw) = if self.chain_upfront() {
             trace::line(self.debug, || {
                 format!(
-                    "! piv sign: command chaining up front ({})",
+                    "! {label}: command chaining up front ({})",
                     self.chain_reason()
                 )
             });
-            self.transmit_chain(
-                "piv sign",
-                &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
-            )?
+            self.transmit_chain(label, chained)?
         } else {
-            let (data, sw) = self.transmit_full(&apdu)?;
-            if sw == piv::SW_OK || !uses_extended_length(&apdu) {
+            let (data, sw) = self.transmit_full(single)?;
+            if sw == piv::SW_OK || !uses_extended_length(single) {
                 (data, sw)
             } else {
                 trace::line(self.debug, || {
                     format!(
-                        "! piv sign: extended length rejected (SW={sw:04X}); retrying with \
+                        "! {label}: extended length rejected (SW={sw:04X}); retrying with \
                          command chaining"
                     )
                 });
-                self.transmit_chain(
-                    "piv sign",
-                    &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
-                )?
+                self.transmit_chain(label, chained)?
             }
         };
-        ok_or_write("piv sign", sw)?;
+        ok_or_write(label, sw)?;
         piv::parse_general_auth(&data, 0x82)
             .map(<[u8]>::to_vec)
             .map_err(TransportError::PivParse)

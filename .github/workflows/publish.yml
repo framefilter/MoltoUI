@@ -91,8 +91,11 @@ jobs:
           # publish must be done by hand before Trusted Publishing can take over.
           # keyroost-screengrab is the same shape: a new, dep-free crate only
           # keyroost uses, so it also needs a one-time hand publish first.
+          # keyroost-pivtest (new in the release after 0.9.0) depends only on
+          # keyroost-piv, so it follows it; same one-time hand publish first.
           for crate in keyroost-proto keyroost-hid keyroost-keyring keyroost-rsakey \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
+                       keyroost-pivtest \
                        keyroost-token2otp keyroost-token2prog keyroost-import \
                        keyroost-transport keyroost-resolve keyroost-qr \
                        keyroost-winwebauthn keyroost-screengrab \

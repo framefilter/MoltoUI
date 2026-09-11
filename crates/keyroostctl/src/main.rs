@@ -180,6 +180,27 @@ mod json_out {
         pub cert_len: usize,
     }
 
+    /// `keyroostctl piv --json test`.
+    #[derive(Serialize)]
+    pub struct PivTestJson {
+        pub slot: String,
+        pub algorithm: String,
+        /// `true` when no operation failed (skipped ops don't count).
+        pub ok: bool,
+        pub operations: Vec<PivTestOpJson>,
+    }
+
+    /// One operation in [`PivTestJson::operations`].
+    #[derive(Serialize)]
+    pub struct PivTestOpJson {
+        pub operation: String,
+        /// `"passed"`, `"failed"`, or `"skipped"`.
+        pub result: String,
+        /// Present only for `"failed"` — a short reason.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub detail: Option<String>,
+    }
+
     /// `keyroostctl openpgp --json status`.
     #[derive(Serialize)]
     pub struct OpenpgpStatusJson {
@@ -973,6 +994,23 @@ enum PivCmd {
         load_pubkey: Option<std::path::PathBuf>,
         #[command(flatten)]
         keygen: InlineKeyGen,
+    },
+    /// Exercise a slot's private key end to end: for every operation the key's
+    /// algorithm supports (decrypt for RSA, key-agree for ECDH curves, sign
+    /// for RSA / ECDSA / Ed25519), run a fixed challenge on the card and
+    /// verify the result against the slot certificate's public key. Reports
+    /// each operation's pass / fail / skipped. Read-only — nothing on the card
+    /// changes. Needs the PIN unless the slot's PIN policy is `never`
+    /// (then omit `--pin-env` / `--pin-stdin`).
+    Test {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
     },
     /// Write a fresh, randomly-generated CHUID (Card Holder Unique
     /// Identifier). Needs the management key. Windows' PIV minidriver caches
@@ -6467,6 +6505,94 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
         }
 
+        PivCmd::Test {
+            reader,
+            slot,
+            pin_env,
+            pin_stdin,
+        } => {
+            let piv_slot = slot.to_slot();
+            // The PIN is optional: a slot whose PIN policy is `never` (usually
+            // 9e) needs none. When given, verify it once up front so a wrong
+            // PIN fails before any op and costs just one retry.
+            let pin = if pin_env.is_some() || *pin_stdin {
+                Some(read_secret("PIN", pin_env.as_deref(), *pin_stdin)?)
+            } else {
+                None
+            };
+
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let cert = s.read_certificate(piv_slot)?.ok_or_else(|| {
+                format!("{} has no certificate to test against", piv_slot.label())
+            })?;
+            let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
+                .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+
+            if !keyroost_pivtest::SelfTest::all()
+                .into_iter()
+                .any(|op| keyroost_pivtest::supports(op, alg))
+            {
+                return Err(format!("no self-test applies to a {} key", alg.label()).into());
+            }
+
+            if let Some(pin) = &pin {
+                s.verify_pin(pin.as_bytes())?;
+            }
+            eprintln!(
+                "\u{2192} Testing {} ({}) on the card (touch if it blinks)\u{2026}",
+                piv_slot.label(),
+                alg.label()
+            );
+
+            let mut ran = 0usize;
+            let results = keyroost_pivtest::run(alg, &pubkey, |op, input| {
+                // PIN-per-use slots (9c) drop the verified state after each
+                // GENERAL AUTHENTICATE — re-verify before every op past the
+                // first that actually runs.
+                if let (Some(pin), true) = (&pin, ran > 0) {
+                    s.verify_pin(pin.as_bytes())?;
+                }
+                ran += 1;
+                if op.is_key_agreement() {
+                    s.key_agree(piv_slot, alg, input)
+                } else if op == keyroost_pivtest::SelfTest::Decrypt {
+                    s.decrypt(piv_slot, alg, input)
+                } else {
+                    s.sign(piv_slot, alg, input)
+                }
+            });
+
+            let all_ok = !results.iter().any(|(_, r)| r.is_failure());
+            if json_output() {
+                emit_json(&json_out::PivTestJson {
+                    slot: piv_slot.label().to_string(),
+                    algorithm: alg.label().to_string(),
+                    ok: all_ok,
+                    operations: results
+                        .iter()
+                        .map(|(op, r)| json_out::PivTestOpJson {
+                            operation: op.label().to_string(),
+                            result: match r {
+                                keyroost_pivtest::Outcome::Passed => "passed",
+                                keyroost_pivtest::Outcome::Skipped(_) => "skipped",
+                                keyroost_pivtest::Outcome::Failed(_) => "failed",
+                            }
+                            .to_string(),
+                            detail: match r {
+                                keyroost_pivtest::Outcome::Failed(e) => Some(e.clone()),
+                                _ => None,
+                            },
+                        })
+                        .collect(),
+                })?;
+            } else {
+                println!("{}", keyroost_pivtest::format_report(&results));
+            }
+            if !all_ok {
+                return Err("one or more self-tests failed".into());
+            }
+        }
+
         PivCmd::NewChuid {
             reader,
             mgmt_key_env,
@@ -9995,6 +10121,46 @@ mod cli_tests {
                 assert_eq!(to.to_slot().key_ref(), 0x82);
             }
             _ => panic!("expected piv move-key"),
+        }
+    }
+
+    #[test]
+    fn piv_test_parses_slot_and_optional_pin() {
+        // No PIN source — valid (PIN-never slots).
+        match parse(&["keyroostctl", "piv", "test", "--slot", "9e"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::Test {
+                        slot,
+                        pin_env,
+                        pin_stdin,
+                        ..
+                    },
+            }) => {
+                assert_eq!(slot.to_slot().key_ref(), 0x9E);
+                assert!(pin_env.is_none() && !pin_stdin);
+            }
+            _ => panic!("expected piv test"),
+        }
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "test",
+            "--slot",
+            "9a",
+            "--pin-env",
+            "KR_PIN",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Test { pin_env, .. },
+            }) => assert_eq!(pin_env.as_deref(), Some("KR_PIN")),
+            _ => panic!("expected piv test"),
         }
     }
 

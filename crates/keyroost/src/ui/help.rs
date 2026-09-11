@@ -24,7 +24,7 @@ pub struct Help {
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
 ///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate, piv-import,
-///   piv-export, piv-delete, piv-admin
+///   piv-export, piv-delete, piv-test, piv-admin, piv-move, piv-retired
 pub fn help(topic: &str) -> Option<&'static Help> {
     Some(match topic {
         "device" => &Help {
@@ -131,6 +131,11 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "Delete from the slot",
             body: "Clearing the certificate leaves the key in place; erasing the private key removes it for good (and needs a YubiKey 5.7 or newer). Both are permanent and can't be undone.",
             slug: "/piv#delete",
+        },
+        "piv-test" => &Help {
+            title: "Test the slot's key",
+            body: "Checks that the slot's private key actually works: keyroost builds a small fixed challenge from the slot certificate's public key, has the card run every operation the key type supports (decrypt for RSA; key-agree for ECDH curves; sign for RSA / ECDSA / Ed25519), and verifies each result against that same public key. It reports each operation's pass or fail. It needs the PIN unless the slot's PIN policy is \u{201c}never\u{201d}, and it changes nothing on the card.",
+            slug: "/piv#test",
         },
         "piv-admin" => &Help {
             title: "Card administration",
