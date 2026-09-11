@@ -183,8 +183,8 @@ keyroostctl piv move-key --from 82 --to 9d --mgmt-key-stdin   # bring it back</c
 keyroostctl piv test --slot 9e                 # PIN policy "never" — omit the PIN
 keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
     <p class="kr-muted">The command prints one line per operation —
-      <code>decrypt: passed</code>, <code>sign: FAILED — …</code>,
-      <code>key-agree: skipped — not supported for …</code> — and exits non-zero if any
+      <code>Decrypt: passed</code>, <code>Sign: FAILED — …</code>,
+      <code>Key Agree: skipped — not supported for …</code> — and exits non-zero if any
       operation failed. With <code>--json</code> it emits
       <code>{ slot, algorithm, ok, operations: [ { operation, result } … ] }</code> instead.
       A slot with no certificate, or a key type keyroost can't verify, is an error — nothing
