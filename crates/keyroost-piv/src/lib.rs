@@ -1453,6 +1453,12 @@ pub fn format_version_bytes(bytes: &[u8]) -> String {
 /// (Nitrokey's admin application). `Err` only when the reply is too long to
 /// fit a `u128` (more than 16 bytes) — there's no way to widen further.
 pub fn parse_serial(buf: &[u8]) -> Result<u128, ParseError> {
+    // An empty body is "no serial", not serial 0: a card that answers GET
+    // SERIAL with `9000` and nothing must read as unavailable, the way it
+    // did when this parser only accepted exactly four bytes.
+    if buf.is_empty() {
+        return Err(ParseError::BadResponse("serial is empty"));
+    }
     if buf.len() > 16 {
         return Err(ParseError::BadResponse("serial is more than 16 bytes"));
     }
@@ -1558,32 +1564,37 @@ pub fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
     find_tlv_recursive_with_limit(buf, tag, 0)
 }
 
+/// How many constructed layers [`find_tlv_recursive`] descends. The FCI a
+/// SELECT response carries nests its objects one or two levels deep (`6F`
+/// wrapping `A5` wrapping the tag), so four is generous for every applet
+/// seen — and it is a hard ceiling, not a hint: the walker recurses on bytes
+/// the card sent, and without a cap a hostile or broken card answering with
+/// deeply nested constructed tags would recurse once per byte of its reply
+/// (a chained SELECT response can run to tens of kilobytes), overflowing the
+/// stack of whatever thread asked for status.
+pub const MAX_TLV_DEPTH: u8 = 4;
+
 /// Like [`find_tlv`], but descends into constructed TLVs (tag bit `0x20`
-/// set) when the target isn't found at the current level, with no limit on
-/// how deep — the FCI a SELECT response carries nests its objects at least
-/// one level deep (`6F` wrapping `A5`, sometimes deeper), and vendors
-/// disagree on exactly how deep a given tag sits. Used by
-/// [`fingerprint::select_identity`] to find tag `0x50` (Application Label)
-/// wherever it is. All tags handled here are single-byte (no multi-byte BER
-/// tag numbers appear in a PIV FCI), same as [`find_tlv`]. A convenience pin
-/// of [`find_tlv_recursive_with_limit`] at `recursion_limit = -1`
-/// (unlimited depth) — every caller so far wants exactly that.
+/// set) when the target isn't found at the current level, at most
+/// [`MAX_TLV_DEPTH`] layers down. Used by [`fingerprint::select_identity`]
+/// to find tag `0x50` (Application Label) wherever a vendor put it. All tags
+/// handled here are single-byte (no multi-byte BER tag numbers appear in a
+/// PIV FCI), same as [`find_tlv`].
 #[must_use]
 pub fn find_tlv_recursive(buf: &[u8], tag: u8) -> Option<&[u8]> {
-    find_tlv_recursive_with_limit(buf, tag, -1)
+    find_tlv_recursive_with_limit(buf, tag, MAX_TLV_DEPTH)
 }
 
 /// The shared walker behind [`find_tlv`] (`recursion_limit = 0`) and
-/// [`find_tlv_recursive`] (`recursion_limit = -1`): finds the value of the
-/// first TLV with single-byte `tag`, descending into constructed TLVs (tag
-/// bit `0x20` set) when the target isn't found at the current level. A
-/// negative `recursion_limit` descends indefinitely; a non-negative one is
-/// reduced by one on every recursive step, and no further descent is
-/// attempted once it reaches zero — so `0` is exactly [`find_tlv`]'s
-/// top-level-only behaviour, and `1` looks one constructed layer deep and no
-/// further.
+/// [`find_tlv_recursive`] (`recursion_limit = MAX_TLV_DEPTH`): finds the
+/// value of the first TLV with single-byte `tag`, descending into constructed
+/// TLVs (tag bit `0x20` set) when the target isn't found at the current
+/// level. `recursion_limit` is reduced by one on every recursive step and no
+/// further descent is attempted once it reaches zero — so `0` is exactly
+/// [`find_tlv`]'s top-level-only behaviour, and `1` looks one constructed
+/// layer deep and no further. There is deliberately no "unbounded" mode.
 #[must_use]
-pub fn find_tlv_recursive_with_limit(buf: &[u8], tag: u8, recursion_limit: i32) -> Option<&[u8]> {
+pub fn find_tlv_recursive_with_limit(buf: &[u8], tag: u8, recursion_limit: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i < buf.len() {
         let t = buf[i];
@@ -1834,8 +1845,9 @@ mod tests {
             .unwrap(),
             0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10
         );
-        // Empty is a degenerate but valid big-endian zero.
-        assert_eq!(parse_serial(&[]).unwrap(), 0);
+        // Empty is "no serial", never serial 0 — a `9000` with an empty body
+        // must surface as unavailable, not as a real-looking value.
+        assert!(parse_serial(&[]).is_err());
         // 17 bytes can't fit a u128.
         assert!(parse_serial(&[0u8; 17]).is_err());
     }
@@ -2658,8 +2670,42 @@ mod tests {
     }
 
     #[test]
-    fn find_tlv_recursive_descends_unlimited() {
+    fn find_tlv_recursive_descends_up_to_max_depth() {
         assert_eq!(find_tlv_recursive(NESTED_TLV, 0x80), Some(&[0xAB][..]));
+    }
+
+    /// Wrap `inner` in `depth` constructed (`0x30`) layers.
+    fn nest(inner: &[u8], depth: usize) -> Vec<u8> {
+        let mut v = inner.to_vec();
+        for _ in 0..depth {
+            assert!(v.len() < 0x80, "test helper only builds short-form lengths");
+            let mut outer = vec![0x30, v.len() as u8];
+            outer.extend_from_slice(&v);
+            v = outer;
+        }
+        v
+    }
+
+    #[test]
+    fn find_tlv_recursive_stops_at_max_depth() {
+        let target = [0x80, 0x01, 0xAB];
+        // Exactly MAX_TLV_DEPTH layers down is still reachable...
+        let reachable = nest(&target, usize::from(MAX_TLV_DEPTH));
+        assert_eq!(find_tlv_recursive(&reachable, 0x80), Some(&[0xAB][..]));
+        // ...one deeper is not: the cap is a hard ceiling, not a hint.
+        let too_deep = nest(&target, usize::from(MAX_TLV_DEPTH) + 1);
+        assert_eq!(find_tlv_recursive(&too_deep, 0x80), None);
+    }
+
+    #[test]
+    fn find_tlv_recursive_survives_pathological_nesting() {
+        // A reply made of nothing but nested constructed tags, as deep as
+        // the short-form length allows chained together: `30 7F 30 7F …`.
+        // Without a depth cap this recursed once per byte.
+        let hostile: Vec<u8> = core::iter::repeat_n([0x30, 0x7F], 20_000)
+            .flatten()
+            .collect();
+        assert_eq!(find_tlv_recursive(&hostile, 0x50), None);
     }
 
     #[test]
@@ -2688,18 +2734,10 @@ mod tests {
     }
 
     #[test]
-    fn find_tlv_recursive_with_limit_negative_means_unbounded() {
-        for limit in [-1, -2, i32::MIN] {
-            assert_eq!(
-                find_tlv_recursive_with_limit(NESTED_TLV, 0x80, limit),
-                Some(&[0xAB][..]),
-                "limit {limit} should recurse indefinitely"
-            );
-        }
-        // find_tlv_recursive is exactly the limit = -1 pin.
+    fn find_tlv_recursive_is_the_max_depth_pin() {
         assert_eq!(
             find_tlv_recursive(NESTED_TLV, 0x80),
-            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, -1)
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, MAX_TLV_DEPTH)
         );
     }
 }

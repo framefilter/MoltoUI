@@ -151,13 +151,17 @@ mod json_out {
         /// Yubico GET VERSION's raw reply, dotted (or hex past 4 bytes),
         /// tolerant of any non-empty byte count.
         pub version: Option<String>,
-        /// Ordinarily the Yubico GET SERIAL extension widened to `u128`; when
-        /// a specific fingerprint's own probe supplies a serial instead
-        /// (currently: a Nitrokey's admin application), that one is used and
-        /// GET SERIAL is skipped — a Nitrokey answers that extension too, but
-        /// with a number that isn't its real serial. `None` when neither
-        /// source answers.
-        pub serial: Option<u128>,
+        /// Ordinarily the Yubico GET SERIAL extension; when a specific
+        /// fingerprint's own probe supplies a serial instead (currently: a
+        /// Nitrokey's admin application), that one is used and GET SERIAL is
+        /// skipped — a Nitrokey answers that extension too, but with a number
+        /// that isn't its real serial. `None` when neither source answers.
+        ///
+        /// A string, not a number: a serial can be up to 128 bits (a
+        /// Nitrokey's admin serial), and a bare JSON number past 2^53 loses
+        /// precision in most consumers. Decimal within `u64`, `0x`-hex
+        /// beyond — the same rendering `piv status`'s text output uses.
+        pub serial: Option<String>,
         pub pin_retries: Option<u8>,
         pub chuid: Option<PivChuidJson>,
         pub slots: Vec<PivSlotJson>,
@@ -6141,7 +6145,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .version
                         .as_deref()
                         .map(keyroost_piv::format_version_bytes),
-                    serial: status.serial,
+                    serial: status.serial.map(keyroost_piv::format_serial_short),
                     pin_retries: status.pin_retries,
                     chuid: status.chuid.as_ref().map(|c| json_out::PivChuidJson {
                         fasc_n: c.fasc_n_display(),
@@ -10530,7 +10534,7 @@ mod cli_tests {
     fn piv_status_json_serializes() {
         let p = json_out::PivStatusJson {
             version: Some("5.4.3".into()),
-            serial: Some(12345678),
+            serial: Some("12345678".into()),
             pin_retries: Some(3),
             chuid: Some(json_out::PivChuidJson {
                 fasc_n: "d4e739da...".into(),
